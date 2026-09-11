@@ -8,7 +8,7 @@ import {randomBytes} from 'node:crypto';
 import WebSocket from 'ws';
 import {createHost} from '../src/server.mjs';
 import {createRelay} from '../src/relay.mjs';
-import {connectHostExec} from '../src/exec-transport.mjs';
+import {connectHostExec,prepareHostExecFrame} from '../src/exec-transport.mjs';
 import {Interactions,interactionResult} from '../src/interactions.mjs';
 import {toolConfiguration} from '../src/codex-runtime.mjs';
 import {tomlValue} from '../src/codex-rpc.mjs';
@@ -46,6 +46,28 @@ test('tool configuration enables native tools while inheriting MCP and excluding
   assert.equal(source.features.shell_tool,false);
   assert.equal(tomlValue({args:['a','b'],enabled:true,absent:null}),'{ "args" = ["a", "b"], "enabled" = true }');
   assert.equal(tomlValue('C:\\tools\\tool.mjs'),'"C:\\\\tools\\\\tool.mjs"');
+});
+
+test('Windows host initializes a UTF-8 console without changing the PowerShell script or sandbox',()=>{
+  const script='Get-Content -LiteralPath "한글 %PATH% & 파일.txt" -Raw\nexit 7';
+  const request={id:7,method:'process/start',params:{processId:'encoding-test',argv:['C:\\Program Files\\Tools\\pwsh.exe','-NoProfile','-Command',script],cwd:'C:\\SharedProject',env:{EXAMPLE:'unchanged'},sandbox:{type:'readOnly'}}};
+  const raw=Buffer.from(JSON.stringify(request)),prepared=prepareHostExecFrame(raw,false,'win32','C:\\Windows'),result=JSON.parse(prepared);
+  assert.equal(result.params.argv[0],'C:\\Windows\\System32\\cmd.exe');
+  const command=result.params.argv.at(-1),encoded=command.split(' -EncodedCommand ')[1];
+  assert.equal(Buffer.from(encoded,'base64').toString('utf16le'),script);assert.ok(!command.includes('Get-Content'));assert.ok(!command.includes('%PATH%'));
+  assert.equal(result.params.env.HIH_EXEC_UTF8_POWERSHELL,'"C:\\Program Files\\Tools\\pwsh.exe"');
+  const restored=structuredClone(result);restored.params.argv=request.params.argv;restored.params.env=request.params.env;assert.deepEqual(restored,request);
+  assert.deepEqual(prepareHostExecFrame(prepared,false,'win32'),prepared);
+  assert.equal(prepareHostExecFrame(raw,false,'darwin'),raw);assert.equal(prepareHostExecFrame(raw,true,'win32'),raw);
+  for(const variant of [
+    {...request,method:'fs/readFile'},
+    {...request,params:{...request.params,argv:['bash','-Command','echo example']}},
+    {...request,params:{...request.params,argv:['pwsh.exe','-File','script.ps1']}},
+    {...request,params:{...request.params,argv:['C:\\Tools\\pwsh.exe','-Command','param($name) $name','extra argument']}},
+    {...request,params:{...request.params,argv:['C:\\Invalid" & echo unsafe & "\\pwsh.exe','-Command','example']}},
+    {...request,params:{...request.params,argv:['C:\\Tools\\pwsh.exe','-Command','x'.repeat(10_000)]}},
+  ]){const bytes=Buffer.from(JSON.stringify(variant));assert.equal(prepareHostExecFrame(bytes,false,'win32'),bytes);}
+  const malformed=Buffer.from('not JSON');assert.equal(prepareHostExecFrame(malformed,false,'win32'),malformed);
 });
 
 test('exec transport authenticates and checks the current lease before starting a host process',async t=>{

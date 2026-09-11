@@ -9,6 +9,24 @@ import {runtimeEnvironment} from './codex-runtime.mjs';
 
 const MAX_FRAME=16*1024*1024,MAX_BUFFER=32*1024*1024;
 const frame=(data,binary)=>({data:Buffer.from(data).toString('base64'),binary});
+export function prepareHostExecFrame(data,binary,platform=process.platform,windowsRoot=process.env.SystemRoot||'C:\\Windows') {
+  if(platform!=='win32'||binary)return data;
+  let message;try{message=JSON.parse(data.toString('utf8'));}catch{return data;}
+  const argv=message?.params?.argv;
+  if(message?.method!=='process/start'||!Array.isArray(argv)||typeof argv[0]!=='string'||!path.win32.isAbsolute(argv[0])||/["\r\n\0]/.test(argv[0])||!/^(?:pwsh|powershell)\.exe$/i.test(path.win32.basename(argv[0])))return data;
+  const index=argv.findIndex((arg,i)=>i>0&&typeof arg==='string'&&arg.toLowerCase()==='-command');
+  if(index<0||index!==argv.length-2||typeof argv[index+1]!=='string'||message.params.arg0||argv.slice(1,index).some(arg=>!/^-(?:noprofile|nologo|noninteractive)$/i.test(arg)))return data;
+  if(!path.win32.isAbsolute(windowsRoot)||/["\r\n\0]/.test(windowsRoot))return data;
+  // ConstrainedLanguage blocks Console.OutputEncoding setters. Set the private
+  // console code page before PowerShell starts, keeping its sandbox unchanged.
+  // CMD sees only fixed switches and base64, never the original script text.
+  const encoded=Buffer.from(argv[index+1],'utf16le').toString('base64');
+  // Preserve commands that would exceed CMD's smaller command-line limit.
+  if(encoded.length+argv[0].length+windowsRoot.length+256>8000)return data;
+  message.params.env={...message.params.env,HIH_EXEC_UTF8_POWERSHELL:'"'+argv[0]+'"',HIH_EXEC_UTF8_CHCP:'"'+path.win32.join(windowsRoot,'System32','chcp.com')+'"'};
+  message.params.argv=[path.win32.join(windowsRoot,'System32','cmd.exe'),'/d','/v:off','/s','/c',`%HIH_EXEC_UTF8_CHCP% 65001 >nul && %HIH_EXEC_UTF8_POWERSHELL% ${argv.slice(1,index).join(' ')} -EncodedCommand ${encoded}`];
+  return Buffer.from(JSON.stringify(message));
+}
 
 // Native exec-server stays on loopback. Its protocol travels through the same
 // authenticated, leased HTTP routes as the session, including the optional relay.
@@ -58,7 +76,8 @@ export async function startHostExec({workspace,dataDir,executable=process.env.HI
     },
     async send(packet) {
       if(ended||packet.sequence!==sequence+1||typeof packet.data!=='string'||typeof packet.binary!=='boolean'||packet.data.length>MAX_FRAME*1.4)throw new Error('잘못되었거나 중복된 실행 환경 메시지입니다.');
-      const data=Buffer.from(packet.data,'base64');if(data.length>MAX_FRAME||data.toString('base64')!==packet.data)throw new Error('Invalid execution frame.');
+      const original=Buffer.from(packet.data,'base64');if(original.length>MAX_FRAME||original.toString('base64')!==packet.data)throw new Error('Invalid execution frame.');
+      const data=prepareHostExecFrame(original,packet.binary);if(data.length>MAX_FRAME)throw new Error('Execution frame too large.');
       sequence++;
       await new Promise((resolve,reject)=>socket.send(data,{binary:packet.binary},error=>error?reject(error):resolve()));
     },

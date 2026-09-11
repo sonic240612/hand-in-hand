@@ -135,6 +135,14 @@ Mac의 기존 실패 턴 복구 파일을 업데이트한 연결기가 인증된
 
 운영 세션 v9의 **별도 복사본**에서 같은 native ID와 전체 원문 접두부를 보존하며 기본 셸 파일 읽기와 웹 검색을 실행했다. 응답은 이전 참여자가 정한 “두손”을 기억했다. 기존 Mac에서 작성·압축된 세션을 Windows의 다른 계정 실행기가 이어받은 검사이며 운영 기록은 변경하지 않았다. `.research/existing-native-tools-report.json`에 결과를 보관한다.
 
-현재 기기의 개인 설정에서 MCP 도구와 스킬이 실제 카탈로그에 로드됐다. `node_repl.js`에서 진단 문자열만 출력하는 MCP 호출도 성공했다. 도구 수는 설치와 로딩 상태에 따라 달라진다. 설치된 도구를 모두 호출한 것은 아니며, 이미지·브라우저·컴퓨터 사용 기능은 계정과 서비스 지원에 따른다. 별도 UI 테스트 세션에서 명령 승인, 질문 답변, MCP 양식 입력을 브라우저로 전달했고 수신된 값과 도구 수 표시를 확인했다. Mac에서 새 원격 도구 연결을 실제 실행하는 검사는 업데이트 후 필요하다.
+현재 기기의 개인 설정에서 MCP 도구와 스킬이 실제 카탈로그에 로드됐다. `node_repl.js`에서 진단 문자열만 출력하는 MCP 호출도 성공했다. 도구 수는 설치와 로딩 상태에 따라 달라진다. 설치된 도구를 모두 호출한 것은 아니며, 이미지·브라우저·컴퓨터 사용 기능은 계정과 서비스 지원에 따른다. 별도 UI 테스트 세션에서 명령 승인, 질문 답변, MCP 양식 입력을 브라우저로 전달했고 수신된 값과 도구 수 표시를 확인했다.
 
 공식 인터페이스: [Codex App Server](https://learn.chatgpt.com/docs/app-server), [MCP 설정](https://learn.chatgpt.com/docs/extend/mcp), [원격 연결](https://learn.chatgpt.com/docs/remote-connections).
+
+## 실제 Mac 원격 도구 실행과 한글 출력
+
+2026-09-11: 사용자가 Mac 연결기를 업데이트하고 Mac 브라우저에서 읽기 전용 도구 테스트를 보냈다. Mac의 Codex가 기본 셸로 Windows 호스트의 `index.html`을 읽고 웹 검색을 완료했다. **v9 → v10 저장, 동일 native ID, v9 원문 전체 접두부 보존**을 확인했다. Mac 실행기의 카탈로그에는 MCP 도구 16개와 스킬 14개가 표시됐으며 세션 차단은 없었다. 로컬 검증 기록은 `.research/mac-native-tools-report.json`이다.
+
+이때 셸 출력의 한글이 깨지는 현상을 발견했다. Windows PowerShell의 CP949 출력과 제한 모드에서 거절되는 `Console.OutputEncoding` 설정이 원인이었다. Windows의 일반 PowerShell `-Command` 실행에 한해 새 실행 콘솔을 UTF-8로 초기화한 후 동일 스크립트를 실행하도록 호스트 전송을 보완했다. 스크립트는 UTF-16LE Base64로 전달하며 CMD 문자열에 원문을 삽입하지 않는다. 기존 작업 경로·환경 설정·샌드박스 권한은 유지하고, 지원하지 않는 인자 형태나 다른 운영체제·바이너리 프레임은 그대로 전달한다.
+
+**자동 테스트 44개 통과.** 별도의 실제 exec-server 진단에서 코드 페이지 65001, `windowsRestrictedToken`·`ConstrainedLanguage` 유지, 한글 원문 출력, 지정한 종료 코드 7 유지, 중단 후 자식 PowerShell 종료를 확인했다. 이 진단은 모델을 호출하지 않았고 운영 세션의 이미 저장된 기록도 수정하지 않았다. 로컬 결과는 `.research/exec-unicode-validation.json`이다. 이 보완은 호스트에서 처리하므로 프로토콜 3의 Mac 연결기를 다시 업데이트할 필요가 없다.
