@@ -1,0 +1,15 @@
+node_modules/
+.hih/
+.hih-agent/
+.research/
+dist/
+*.log
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.jsonl
+.codex/

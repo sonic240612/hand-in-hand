@@ -1,0 +1,4 @@
+# Replace with a domain whose DNS points at the relay server.
+collab.example.com {
+    reverse_proxy 127.0.0.1:4318
+}
