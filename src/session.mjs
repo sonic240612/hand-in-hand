@@ -43,9 +43,16 @@ export function inspectInterruptedCompaction(checkpoint, previous, turn, nativeI
     if(['compacted','token_usage_record','turn_context','world_state'].includes(r.type)) continue;
     if(r.type==='response_item' && r.payload?.type==='message') {
       if(['system','developer'].includes(r.payload.role)) continue;
+      // Codex 0.154.0 can persist its own abort notice as a user message.
+      // Bind this control record to the confirmed native turn, not just its text tag.
+      const p=r.payload,m=p.internal_chat_message_metadata_passthrough;
+      if(p.role==='user' && m?.turn_id===started[0].payload.turn_id &&
+        m.content_item_kinds?.length===1 && m.content_item_kinds[0]==='generic.turn_aborted' &&
+        p.content?.length===1 && p.content[0].type==='input_text' &&
+        /^<turn_aborted>\n[^]*\n<\/turn_aborted>$/.test(p.content[0].text)) continue;
       if(r.payload.role==='user' && r.payload.content?.some(c=>typeof c.text==='string'&&c.text.includes(turn.prompt))) continue;
     }
-    throw new Error('Recovery contains model output or unverified activity; automatic recovery refused.');
+    throw new Error(`Recovery contains model output or unverified activity (${r.type}/${r.payload?.type||'unknown'}/${r.payload?.role||'-'}); automatic recovery refused.`);
   }
   return info;
 }
@@ -85,7 +92,16 @@ export class SessionStore {
   recoverCompaction(memberId,turnId,checkpoint) {
     if(!this.pendingCompactionRecovery(memberId).some(t=>t.id===turnId)) throw new Error('이 계정에서 복구할 수 있는 압축 중단 기록이 없습니다.');
     const turn=this.state.turns.find(t=>t.id===turnId);
-    const info=inspectInterruptedCompaction(checkpoint,this.state.checkpoint,turn,this.state.nativeId);
+    const info=inspectCheckpoint(checkpoint,this.state.nativeId,this.state.checkpoint);
+    try {inspectInterruptedCompaction(checkpoint,this.state.checkpoint,turn,this.state.nativeId);}
+    catch(error) {
+      // A valid append-only native log may still need review. Preserve it separately;
+      // it must never become the active checkpoint merely because it was uploaded.
+      const candidates=path.join(path.dirname(this.file),'recovery-candidates');mkdirSync(candidates,{recursive:true});
+      const candidate=path.join(candidates,`${turn.id}-${info.hash}.jsonl`);
+      if(!existsSync(candidate))writeFileSync(candidate,checkpoint,{mode:0o600,flag:'wx'});
+      throw new Error(`${error.message} 복구 후보 원본을 호스트에 보관했습니다.`);
+    }
     if(inspectCheckpoint(this.state.checkpoint,this.state.nativeId).hash!==this.state.checkpointHash) throw new Error('Host checkpoint checksum mismatch.');
     const dir=path.join(path.dirname(this.file),'recoveries');mkdirSync(dir,{recursive:true});
     const stamp=randomUUID();

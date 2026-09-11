@@ -4,7 +4,7 @@ import {mkdtemp,rm,readdir,readFile} from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import {SessionStore,digest,inspectCheckpoint,inspectInterruptedCompaction,LEGACY_COMPACTION_ERROR} from '../src/session.mjs';
-import {nativeId,original,compact,interrupted,message,event,line} from './fixtures/native-session.mjs';
+import {nativeId,original,compact,interrupted,message,event,line,abortNotice} from './fixtures/native-session.mjs';
 
 async function fixture(t) {
   const dir=await mkdtemp(path.join(os.tmpdir(),'hih-compaction-'));t.after(()=>rm(dir,{recursive:true,force:true}));
@@ -38,7 +38,7 @@ test('a completed compacted turn is handed to the next participant with the same
 });
 
 test('legacy interrupted compaction is backed up, kept in full, and retried only after recovery',async t=>{
-  for(const middle of ['',compact(),message('user','What did the other participant say?')]) {
+  for(const middle of ['',compact(),message('user','What did the other participant say?'),abortNotice()]) {
     const {store,turn,dir,member}=await fixture(t),checkpoint=original+interrupted(middle);
     store.fail(turn,LEGACY_COMPACTION_ERROR);
     const before=await readFile(store.file,'utf8');
@@ -66,6 +66,9 @@ test('recovery refuses output, tools, different instructions, missing stops, or 
     original+interrupted(message('assistant','May have acted.')),
     original+interrupted(line({type:'response_item',payload:{type:'function_call',name:'host_write_file'}})),
     original+interrupted(message('user','An unrelated instruction')),
+    original+interrupted(abortNotice({internal_chat_message_metadata_passthrough:{turn_id:'wrong-turn',content_item_kinds:['generic.turn_aborted']}})),
+    original+interrupted(abortNotice({internal_chat_message_metadata_passthrough:{turn_id:'native-turn',content_item_kinds:['user']}})),
+    original+interrupted(abortNotice({content:[{type:'input_text',text:'An unrelated instruction'}]})),
     original+interrupted(event('user_message',{message:'An unrelated instruction'})),
     original+interrupted(event('task_started',{turn_id:'another-turn'})),
     original+interrupted(event('turn_aborted',{turn_id:'another-turn',reason:'interrupted'})),
@@ -77,6 +80,9 @@ test('recovery refuses output, tools, different instructions, missing stops, or 
     assert.equal(await readFile(store.file,'utf8'),before);assert.ok(store.state.blocked);
   }
   assert.ok(!(await readdir(dir)).includes('recoveries'));
+  const candidates=await readdir(path.join(dir,'recovery-candidates'));
+  assert.ok(candidates.length>0);
+  for(const name of candidates)assert.ok((await readFile(path.join(dir,'recovery-candidates',name),'utf8')).startsWith(original));
   assert.throws(()=>inspectInterruptedCompaction(original+interrupted(),original,turn,'different-id'),/ID changed/);
 });
 
