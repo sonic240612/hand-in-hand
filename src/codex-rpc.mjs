@@ -3,7 +3,7 @@ import { EventEmitter } from 'node:events';
 import { createInterface } from 'node:readline';
 
 export class CodexRpc extends EventEmitter {
-  constructor({ executable = process.env.HIH_CODEX_BIN || 'codex', cwd, env = process.env } = {}) {
+  constructor({ executable = process.env.HIH_CODEX_BIN || 'codex', cwd, env = process.env, config: overrides = {}, argsPrefix = [] } = {}) {
     super();
     this.nextId = 1;
     this.pending = new Map();
@@ -17,8 +17,9 @@ export class CodexRpc extends EventEmitter {
       'features.multi_agent': false,
       'web_search': 'disabled',
       'mcp_servers': {},
+      ...overrides,
     };
-    const args = ['app-server', '--stdio'];
+    const args = [...argsPrefix, 'app-server', '--stdio'];
     for (const [key, value] of Object.entries(config)) {
       args.push('-c', `${key}=${JSON.stringify(value)}`);
     }
@@ -35,8 +36,12 @@ export class CodexRpc extends EventEmitter {
         if (!pending) return;
         clearTimeout(pending.timer);
         this.pending.delete(msg.id);
-        msg.error ? pending.reject(new Error(`${msg.error.message} (${msg.error.code})`)) : pending.resolve(msg.result);
+        msg.error ? pending.reject(Object.assign(new Error(`${msg.error.message} (${msg.error.code})`), {code:msg.error.code, rpcMethod:pending.method})) : pending.resolve(msg.result);
       }
+    });
+    this.exited = new Promise(resolve => {
+      this.child.once('exit', resolve);
+      this.child.once('error', () => { if (!this.child.pid) { this.closed = true; resolve(); } });
     });
     this.child.on('error', error => this.fail(error));
     this.child.on('exit', (code, signal) => {
@@ -57,7 +62,7 @@ export class CodexRpc extends EventEmitter {
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => { this.pending.delete(id); reject(new Error(`Codex RPC timeout: ${method}`)); }, timeout);
-      this.pending.set(id, { resolve, reject, timer });
+      this.pending.set(id, { resolve, reject, timer, method });
       try { this.send({ id, method, params }); } catch (error) { clearTimeout(timer); this.pending.delete(id); reject(error); }
     });
   }
@@ -69,10 +74,22 @@ export class CodexRpc extends EventEmitter {
     this.send({ method: 'initialized' });
     return result;
   }
-  async close() {
+  close() {
+    return this.closing ||= this.stop();
+  }
+  async stop() {
     if (this.closed) return;
+    // Don't let the next runner start while this process still holds its writer lock.
     this.child.stdin.end();
-    await Promise.race([new Promise(resolve => this.child.once('exit', resolve)), new Promise(resolve => setTimeout(resolve, 1500))]);
-    if (!this.closed) this.child.kill();
+    let timer;
+    try {
+      await Promise.race([this.exited, new Promise(resolve => { timer=setTimeout(resolve,1500); })]);
+    } finally { clearTimeout(timer); }
+    if (!this.closed) {
+      this.child.kill('SIGKILL');
+      try {
+        await Promise.race([this.exited, new Promise((_,reject) => { timer=setTimeout(()=>reject(new Error('Codex 프로세스 종료를 확인하지 못했습니다.')),5000); })]);
+      } finally { clearTimeout(timer); }
+    }
   }
 }

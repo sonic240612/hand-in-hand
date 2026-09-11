@@ -4,6 +4,7 @@ import path from 'node:path';
 
 export const digest = text => createHash('sha256').update(text).digest('hex');
 export const MAX_CHECKPOINT = 16 * 1024 * 1024;
+const WRITER_CONFLICT = /^thread ([0-9a-f-]+) already has an active writer \(-32600\)$/;
 export function inspectCheckpoint(text, expectedId = null, previous = '') {
   if (typeof text !== 'string' || Buffer.byteLength(text) > MAX_CHECKPOINT || !text.endsWith('\n')) throw new Error('Invalid or oversized session checkpoint.');
   if (previous && !text.startsWith(previous)) throw new Error('Session history was rewritten or omitted. Continuation rejected.');
@@ -24,7 +25,7 @@ export class SessionStore {
       revision: 0, nativeId: null, checkpoint: '', checkpointHash: digest(''),
       turns: [], participants: [], invites: [], pairings: [], blocked: null,
     };
-    let recovered = false;
+    let recovered = this.recoverWriterConflict();
     for (const turn of this.state.turns) {
       if (['running', 'syncing'].includes(turn.status)) {
         turn.status = 'interrupted'; turn.error = '호스트가 재시작되었습니다. 미확정 세션 복구가 필요합니다.';
@@ -39,6 +40,32 @@ export class SessionStore {
     renameSync(tmp, this.file);
   }
   get active() { return this.state.turns.find(t => ['running', 'syncing'].includes(t.status)); }
+  canRetryWriterConflict(turn, message) {
+    const s=this.state;
+    if(WRITER_CONFLICT.exec(message)?.[1]!==s.nativeId || !s.nativeId ||
+      turn.baseRevision!==s.revision || turn.baseHash!==s.checkpointHash ||
+      turn.appliedHash!==undefined || turn.appliedRevision!==undefined || turn.nativeId ||
+      turn.committedRevision!==undefined || turn.tools.length || turn.items.length) return false;
+    try { return inspectCheckpoint(s.checkpoint,s.nativeId).hash===s.checkpointHash; } catch { return false; }
+  }
+  recoverWriterConflict() {
+    // Narrow migration for the old client: resume was rejected before /applied,
+    // no model/tool activity occurred, and the committed checkpoint is intact.
+    if(!this.state.blocked || this.state.turns.some(t=>['running','syncing'].includes(t.status))) return false;
+    const interrupted=this.state.turns.filter(t=>t.status==='interrupted');
+    if(interrupted.length!==1 || !this.canRetryWriterConflict(interrupted[0],interrupted[0].error)) return false;
+    const backup=path.join(path.dirname(this.file),`before-writer-recovery-${randomUUID()}.json`);
+    writeFileSync(backup,JSON.stringify(this.state),{mode:0o600,flag:'wx'});
+    Object.assign(interrupted[0],{status:'failed',retryable:true,failurePhase:'resume_rejected'});
+    this.state.blocked=null;
+    return true;
+  }
+  retry(turn) {
+    if(this.state.blocked || this.active || turn.status!=='failed' || !turn.retryable) throw new Error('이 작업은 안전하게 다시 실행할 수 없습니다.');
+    // Re-submit at the end of the queue using the latest committed session.
+    const next=this.enqueue({id:turn.authorId,name:turn.authorName},turn.prompt,`retry-${turn.id}`);
+    turn.retriedAs=next.id;turn.retryable=false;this.save();return next;
+  }
   enqueue(member, prompt, requestId) {
     if (this.state.blocked) throw new Error(this.state.blocked);
     if (!prompt?.trim() || prompt.length > 20_000) throw new Error('지시는 1~20,000자로 입력해 주세요.');
@@ -72,7 +99,11 @@ export class SessionStore {
     delete turn.lease;
     this.save(); return info;
   }
-  fail(turn, message) {
+  fail(turn, message, failurePhase) {
+    if(turn.status==='syncing' && failurePhase==='resume_rejected' && this.canRetryWriterConflict(turn,message)) {
+      Object.assign(turn,{status:'failed',error:message,failurePhase,retryable:true,completedAt:new Date().toISOString()});
+      delete turn.lease;this.save();return;
+    }
     turn.status = 'interrupted'; turn.error = message; delete turn.lease;
     this.state.blocked = '세션 저장을 확인하지 못했습니다. 기록 손실을 막기 위해 다음 실행을 중지했습니다.';
     this.save();

@@ -4,7 +4,7 @@ import os from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline/promises';
-import { CodexRpc } from './codex-rpc.mjs';
+import { createCodexRuntime } from './codex-runtime.mjs';
 import { digest, inspectCheckpoint } from './session.mjs';
 import { HOST_TOOLS } from './workspace.mjs';
 
@@ -14,16 +14,17 @@ All project files are on the HOST, accessible ONLY through host_list_files, host
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 function identity(account) {
   if (!account) throw new Error('Codex 로그인이 필요합니다. 이 기기에서 codex login 후 다시 연결하세요.');
+  if (account.type!=='chatgpt') throw new Error('추가 과금 방지를 위해 ChatGPT 계정 로그인만 지원합니다.');
   const id = account.email || account.chatgptAccountId || account.id;
   const masked = account.email ? account.email.replace(/^(.).+(@.*)$/, '$1***$2') : account.type;
   return { label: `${masked} · ${account.planType || account.type}`, type: account.type,
     fingerprint: id ? digest(`${account.type}:${id}`) : null };
 }
-export async function runNativeTurn({ job, accountExpected, api, dataDir, signal, executable }) {
+export async function runNativeTurn({ job, accountExpected, api, dataDir, signal, executable, rpcFactory=createCodexRuntime }) {
   const scratch = path.join(dataDir, 'empty-workspace');
   const checkpoints = path.join(dataDir, 'checkpoints');
   await mkdir(scratch,{recursive:true}); await mkdir(checkpoints,{recursive:true});
-  const rpc = new CodexRpc({cwd:scratch,executable});
+  const rpc = await rpcFactory({cwd:scratch,executable,dataDir});
   let nativeId, rolloutPath, nativeTurnId, completed, fatal, usage;
   let chain = Promise.resolve();
   const emit = body => { chain = chain.then(()=>api(`/api/worker/turns/${job.id}/event`, {lease:job.lease,...body})); chain.catch(()=>{}); };
@@ -44,6 +45,7 @@ export async function runNativeTurn({ job, accountExpected, api, dataDir, signal
     if(msg.method==='turn/completed') {completed=p.turn;finish();}
   });
   rpc.on('request',async msg=>{
+    if(msg.method==='account/chatgptAuthTokens/refresh') return;
     try {
       if(msg.method!=='item/tool/call') { rpc.send({id:msg.id,error:{code:-32601,message:'Only shared host tools are supported. No local approvals or tools.'}}); return; }
       const p=msg.params;
@@ -94,7 +96,8 @@ export async function runNativeTurn({ job, accountExpected, api, dataDir, signal
     await rpc.close();
     // Preserve a recoverable partial native log locally; never silently restart with old history.
     if(rolloutPath) {try {await writeFile(path.join(checkpoints,`${job.id}.recovery.jsonl`),await readFile(rolloutPath),{mode:0o600});}catch{}}
-    try {await api(`/api/worker/turns/${job.id}/fail`,{lease:job.lease,error:error.message});}catch{}
+    const failurePhase=!nativeId && error.rpcMethod==='thread/resume' && error.code===-32600 ? 'resume_rejected' : undefined;
+    try {await api(`/api/worker/turns/${job.id}/fail`,{lease:job.lease,error:error.message,failurePhase});}catch{}
     throw error;
   } finally {
     clearInterval(heartbeat);clearTimeout(timeout);signal?.removeEventListener('abort',abort);
@@ -121,7 +124,7 @@ export async function runAgent({ host, pair, dataDir=path.resolve('.hih-agent'),
     token=saved.token;
   }
   const scratch=path.join(dataDir,'empty-workspace');await mkdir(scratch,{recursive:true});
-  const probe=new CodexRpc({cwd:scratch,executable});
+  const probe=await createCodexRuntime({cwd:scratch,executable,dataDir});
   let account,runtime;
   try {
     runtime=await probe.initialize();

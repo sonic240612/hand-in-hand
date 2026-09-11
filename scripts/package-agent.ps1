@@ -4,7 +4,7 @@ $distributionRoot = Join-Path $projectRoot 'dist'
 $agentPackageRoot = Join-Path $distributionRoot 'hand-in-hand-agent'
 $agentSourceRoot = Join-Path $agentPackageRoot 'src'
 New-Item -ItemType Directory -Path $agentSourceRoot -Force | Out-Null
-foreach ($sourceName in @('agent.mjs', 'codex-rpc.mjs', 'session.mjs', 'workspace.mjs')) {
+foreach ($sourceName in @('agent.mjs', 'codex-rpc.mjs', 'codex-runtime.mjs', 'session.mjs', 'workspace.mjs')) {
     Copy-Item -LiteralPath (Join-Path (Join-Path $projectRoot 'src') $sourceName) -Destination (Join-Path $agentSourceRoot $sourceName) -Force
 }
 $agentPackageJson = @'

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, readdir, readFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { SessionStore, digest, inspectCheckpoint } from '../src/session.mjs';
@@ -45,4 +45,56 @@ test('missing current user instruction cannot be committed',async t=>{
   const store=await setup(t),a={id:'a',name:'A'};store.enqueue(a,'Specific required instruction','a1');const turn=store.claim('a','ra','account','fp');
   assert.throws(()=>store.complete(turn,{checkpoint:meta+user('Different instruction'),nativeId:'native-shared-id',status:'completed'}),/instruction is missing/);
   assert.equal(store.state.revision,0);
+});
+
+async function writerFixture(t) {
+  const store=await setup(t),member={id:'a',name:'A'};
+  const first=store.enqueue(member,'Remember our original instruction','first');store.claim('a','runner','account','fp');
+  store.complete(first,{checkpoint:meta+user(first.prompt)+assistant('Remembered.'),nativeId:'native-shared-id',status:'completed'});
+  // Use a real UUID shape, as returned by Codex, for the error classifier.
+  store.state.nativeId='11111111-1111-4111-8111-111111111111';
+  store.state.checkpoint=store.state.checkpoint.replace('native-shared-id',store.state.nativeId);
+  store.state.checkpointHash=digest(store.state.checkpoint);store.save();
+  const turn=store.enqueue(member,'Continue without losing history','next');store.claim('a','runner','account','fp');
+  return {store,turn,error:`thread ${store.state.nativeId} already has an active writer (-32600)`};
+}
+
+test('explicit writer rejection before resume completes can retry without changing committed history',async t=>{
+  const {store,turn,error}=await writerFixture(t),before=store.state.checkpoint;
+  store.fail(turn,error,'resume_rejected');
+  assert.equal(store.state.blocked,null);assert.equal(turn.retryable,true);
+  const next=store.retry(turn);assert.equal(next.prompt,turn.prompt);
+  assert.equal(store.claim('a','new-runner','account','fp').id,next.id);
+  assert.equal(next.baseHash,digest(before));assert.equal(store.state.revision,1);
+  assert.equal(store.state.checkpoint,before);assert.throws(()=>store.retry(turn));
+});
+
+test('legacy writer rejection is backed up and recovered on restart only when no turn was applied',async t=>{
+  const {store,turn,error}=await writerFixture(t);
+  store.fail(turn,error);
+  const before=await readFile(store.file,'utf8');
+  const restored=new SessionStore(path.dirname(store.file));
+  assert.equal(restored.state.blocked,null);assert.equal(restored.state.turns.at(-1).retryable,true);
+  assert.equal(restored.state.checkpoint,store.state.checkpoint);
+  const files=await readdir(path.dirname(store.file));const backups=files.filter(n=>n.startsWith('before-writer-recovery-'));
+  assert.equal(backups.length,1);assert.equal(await readFile(path.join(path.dirname(store.file),backups[0]),'utf8'),before);
+  new SessionStore(path.dirname(store.file));assert.equal((await readdir(path.dirname(store.file))).filter(n=>n.startsWith('before-writer-recovery-')).length,1);
+});
+
+test('writer text cannot unblock a started, changed, corrupt, or ambiguous session',async t=>{
+  for(const mutate of [
+    turn=>{turn.status='running';turn.appliedRevision=1;},
+    turn=>{turn.tools.push({name:'host_write_file'});},
+    turn=>{turn.items.push({text:'model output'});},
+    turn=>{turn.baseHash='stale';},
+    (turn,store)=>{store.state.checkpointHash='corrupt';},
+    (turn,store)=>{store.state.turns.push({id:'unknown',status:'interrupted',error:'connection lost'});},
+  ]) {
+    const {store,turn,error}=await writerFixture(t);mutate(turn,store);
+    store.fail(turn,error);const restarted=new SessionStore(path.dirname(store.file));
+    assert.ok(restarted.state.blocked);assert.notEqual(restarted.state.turns.find(x=>x.id===turn.id).retryable,true);
+  }
+  const {store,turn}=await writerFixture(t);
+  store.fail(turn,'Codex RPC timeout: thread/resume','resume_rejected');
+  assert.ok(store.state.blocked);
 });

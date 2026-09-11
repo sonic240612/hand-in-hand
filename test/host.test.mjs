@@ -54,3 +54,26 @@ test('API rejects cross-origin bootstrap and private files are never static asse
   const result=await fetch(host.url+'/api/bootstrap',{method:'POST',headers:{Origin:'https://untrusted.example'},body:'{}'});assert.equal(result.status,403);
   assert.equal((await fetch(host.url+'/.hih/session.json')).status,404);
 });
+
+test('writer-conflict retry preserves history, is author-only, and is idempotent over HTTP',async t=>{
+  const {host,call}=await fixture(t);
+  const owner=(await call('/api/bootstrap',{})).data;
+  const invite=(await call('/api/invites',{},owner.token)).data;
+  const b=(await call('/api/join',{code:invite.code,name:'B'})).data;
+  const code=(await call('/api/pairing',{},b.token)).data.code;
+  const agent=(await call('/api/agent/pair',{code})).data;
+  await call('/api/worker/register',{runnerId:'b-runner',account:'B account'},agent.token);
+  const nativeId='11111111-1111-4111-8111-111111111111';
+  const checkpoint=JSON.stringify({type:'session_meta',payload:{id:nativeId}})+'\n';
+  const {digest}=await import('../src/session.mjs');
+  Object.assign(host.store.state,{nativeId,checkpoint,checkpointHash:digest(checkpoint),revision:1});host.store.save();
+  await call('/api/turns',{prompt:'Continue the same conversation',requestId:'b1'},b.token);
+  const {job}=(await call('/api/worker/claim',{runnerId:'b-runner'},agent.token)).data;
+  assert.equal((await call(`/api/worker/turns/${job.id}/fail`,{lease:job.lease,error:`thread ${nativeId} already has an active writer (-32600)`,failurePhase:'resume_rejected'},agent.token)).status,200);
+  assert.equal(host.store.state.blocked,null);
+  assert.equal((await call(`/api/turns/${job.id}/retry`,{},owner.token)).status,403);
+  const first=await call(`/api/turns/${job.id}/retry`,{},b.token);
+  const duplicate=await call(`/api/turns/${job.id}/retry`,{},b.token);
+  assert.equal(first.status,200);assert.equal(first.data.turn.id,duplicate.data.turn.id);
+  assert.equal(host.store.state.turns.length,2);assert.equal(host.store.state.checkpoint,checkpoint);
+});

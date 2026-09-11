@@ -162,7 +162,7 @@ export async function createHost({ port=4317, listen='127.0.0.1', dataDir=path.r
           const promise=toolChain.then(perform);toolChain=promise.catch(()=>{});return json(res,200,await promise);
         }
         if(match[2]==='complete') {const result=store.complete(turn,p);broadcast();return json(res,200,{ok:true,...result});}
-        if(match[2]==='fail') {store.fail(turn,String(p.error||'세션 저장 실패').slice(0,3000));broadcast();return json(res,200,{ok:true});}
+        if(match[2]==='fail') {store.fail(turn,String(p.error||'세션 저장 실패').slice(0,3000),p.failurePhase);broadcast();return json(res,200,{ok:true});}
       }
       if(route.startsWith('/api/')) {
         const member=memberFor(req);
@@ -189,6 +189,13 @@ export async function createHost({ port=4317, listen='127.0.0.1', dataDir=path.r
           return json(res,200,{ok:true});
         }
         if(route==='/api/turns' && req.method==='POST') {const p=await body(req);const turn=store.enqueue(member,p.prompt,p.requestId);broadcast();return json(res,200,{turn});}
+        const retry=route.match(/^\/api\/turns\/([^/]+)\/retry$/);
+        if(retry && req.method==='POST') {
+          const turn=store.state.turns.find(t=>t.id===retry[1]);
+          if(!turn || turn.authorId!==member.id)return json(res,403,{error:'내 작업만 다시 실행할 수 있습니다.'});
+          if(turn.retriedAs) return json(res,200,{turn:store.state.turns.find(t=>t.id===turn.retriedAs)});
+          const next=store.retry(turn);broadcast();return json(res,200,{turn:next});
+        }
         const cancel=route.match(/^\/api\/turns\/([^/]+)\/cancel$/);
         if(cancel && req.method==='POST') {
           const turn=store.state.turns.find(t=>t.id===cancel[1]);
@@ -241,7 +248,7 @@ export async function createHost({ port=4317, listen='127.0.0.1', dataDir=path.r
     }
   }
   return {server,store,files,url:`http://127.0.0.1:${actualPort}`,port:actualPort,
-    async close() {clearInterval(monitor);clearInterval(tailscaleMonitor);for(const entry of localAgents.values())entry.controller.abort();for(const res of streams)res.end();await tailscaleAccess?.close();await relayConnection?.close();if(remoteServer){remoteServer.closeAllConnections();await new Promise(resolve=>remoteServer.close(resolve));}server.closeAllConnections();await new Promise(resolve=>server.close(resolve));try{unlinkSync(lockFile);}catch{}},
+    async close() {clearInterval(monitor);clearInterval(tailscaleMonitor);for(const entry of localAgents.values())entry.controller.abort();await Promise.allSettled([...localAgents.values()].map(entry=>entry.promise));for(const res of streams)res.end();await tailscaleAccess?.close();await relayConnection?.close();if(remoteServer){remoteServer.closeAllConnections();await new Promise(resolve=>remoteServer.close(resolve));}server.closeAllConnections();await new Promise(resolve=>server.close(resolve));try{unlinkSync(lockFile);}catch{}},
   };
 }
 if(process.argv[1] && path.resolve(process.argv[1])===fileURLToPath(import.meta.url)) {
