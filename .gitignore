@@ -13,3 +13,8 @@ dist/
 *.pfx
 *.jsonl
 .codex/
+
+# Local planning notes and participant guide
+/hand-in-hand_기획서.md
+/hand-in-hand_project.txt
+/AGENT-README.md
