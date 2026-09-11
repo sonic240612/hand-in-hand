@@ -5,6 +5,7 @@ import path from 'node:path';
 export const digest = text => createHash('sha256').update(text).digest('hex');
 export const MAX_CHECKPOINT = 16 * 1024 * 1024;
 const WRITER_CONFLICT = /^thread ([0-9a-f-]+) already has an active writer \(-32600\)$/;
+export const LEGACY_COMPACTION_ERROR = '세션 압축이 감지되어 동일 기록 검증을 중지했습니다.';
 export function inspectCheckpoint(text, expectedId = null, previous = '') {
   if (typeof text !== 'string' || Buffer.byteLength(text) > MAX_CHECKPOINT || !text.endsWith('\n')) throw new Error('Invalid or oversized session checkpoint.');
   if (previous && !text.startsWith(previous)) throw new Error('Session history was rewritten or omitted. Continuation rejected.');
@@ -12,8 +13,41 @@ export function inspectCheckpoint(text, expectedId = null, previous = '') {
   const meta = records[0];
   if (meta?.type !== 'session_meta' || !meta.payload?.id) throw new Error('Missing native session metadata.');
   if (expectedId && meta.payload.id !== expectedId) throw new Error('Native session ID changed. Continuation rejected.');
-  if (records.some(record => record.type === 'compacted' || record.type === 'event_msg' && /compact/i.test(record.payload?.type || ''))) throw new Error('Compacted sessions are outside this prototype’s verified support.');
-  return { nativeId: meta.payload.id, hash: digest(text), records: records.length, bytes: Buffer.byteLength(text), responseItems: records.filter(r => r.type === 'response_item').length };
+  let compactions=0,windowId=meta.payload.context_window?.window_id,windowNumber=0;
+  for(const record of records.slice(1)) {
+    if(record.type==='session_meta') throw new Error('Multiple native session headers are not allowed.');
+    if(record.type!=='compacted') continue;
+    const p=record.payload;
+    if(!p || typeof p.message!=='string' || !Array.isArray(p.replacement_history) || !p.replacement_history.length ||
+      p.replacement_history.some(item=>!item || typeof item.type!=='string')) throw new Error('Incomplete native compaction checkpoint.');
+    if(typeof p.window_id!=='string' || !p.window_id || p.window_id===windowId ||
+      (windowId && p.previous_window_id!==windowId) || !Number.isInteger(p.window_number) || p.window_number<=windowNumber) throw new Error('Native compaction window chain is invalid.');
+    windowId=p.window_id;windowNumber=p.window_number;compactions++;
+  }
+  return { nativeId: meta.payload.id, hash: digest(text), records: records.length, bytes: Buffer.byteLength(text), responseItems: records.filter(r => r.type === 'response_item').length,compactions,contextWindowId:windowId||null };
+}
+
+export function inspectInterruptedCompaction(checkpoint, previous, turn, nativeId) {
+  const info=inspectCheckpoint(checkpoint,nativeId,previous);
+  const suffix=checkpoint.slice(previous.length).trim().split('\n').filter(Boolean).map(JSON.parse);
+  const started=suffix.filter(r=>r.type==='event_msg' && r.payload?.type==='task_started');
+  const terminal=suffix.at(-1);
+  if(started.length!==1 || !started[0].payload.turn_id || terminal?.type!=='event_msg' ||
+    terminal.payload?.type!=='turn_aborted' || terminal.payload.turn_id!==started[0].payload.turn_id || terminal.payload.reason!=='interrupted') throw new Error('Interrupted compaction has no confirmed stop record.');
+  const stopped=suffix.filter(r=>r.type==='event_msg' && r.payload?.type==='turn_aborted');
+  if(stopped.length!==1) throw new Error('Interrupted compaction contains ambiguous stop records.');
+  const allowedEvents=new Set(['task_started','turn_aborted','thread_settings_applied','token_count','context_compacted']);
+  for(const r of suffix) {
+    if(r.type==='event_msg' && allowedEvents.has(r.payload?.type)) continue;
+    if(r.type==='event_msg' && r.payload?.type==='user_message' && typeof r.payload.message==='string' && r.payload.message.includes(turn.prompt)) continue;
+    if(['compacted','token_usage_record','turn_context','world_state'].includes(r.type)) continue;
+    if(r.type==='response_item' && r.payload?.type==='message') {
+      if(['system','developer'].includes(r.payload.role)) continue;
+      if(r.payload.role==='user' && r.payload.content?.some(c=>typeof c.text==='string'&&c.text.includes(turn.prompt))) continue;
+    }
+    throw new Error('Recovery contains model output or unverified activity; automatic recovery refused.');
+  }
+  return info;
 }
 
 export class SessionStore {
@@ -40,6 +74,28 @@ export class SessionStore {
     renameSync(tmp, this.file);
   }
   get active() { return this.state.turns.find(t => ['running', 'syncing'].includes(t.status)); }
+  pendingCompactionRecovery(memberId) {
+    const s=this.state,interrupted=s.turns.filter(t=>t.status==='interrupted');
+    if(!s.blocked || this.active || interrupted.length!==1) return [];
+    const turn=interrupted[0];
+    return turn.authorId===memberId && turn.error===LEGACY_COMPACTION_ERROR && !turn.tools.length && !turn.items.length &&
+      turn.baseRevision===s.revision && turn.baseHash===s.checkpointHash && turn.appliedRevision===s.revision &&
+      turn.appliedHash===s.checkpointHash && turn.nativeId===s.nativeId ? [{id:turn.id,nativeId:s.nativeId}] : [];
+  }
+  recoverCompaction(memberId,turnId,checkpoint) {
+    if(!this.pendingCompactionRecovery(memberId).some(t=>t.id===turnId)) throw new Error('이 계정에서 복구할 수 있는 압축 중단 기록이 없습니다.');
+    const turn=this.state.turns.find(t=>t.id===turnId);
+    const info=inspectInterruptedCompaction(checkpoint,this.state.checkpoint,turn,this.state.nativeId);
+    if(inspectCheckpoint(this.state.checkpoint,this.state.nativeId).hash!==this.state.checkpointHash) throw new Error('Host checkpoint checksum mismatch.');
+    const dir=path.join(path.dirname(this.file),'recoveries');mkdirSync(dir,{recursive:true});
+    const stamp=randomUUID();
+    writeFileSync(path.join(dir,`${stamp}-before.json`),JSON.stringify(this.state),{mode:0o600,flag:'wx'});
+    writeFileSync(path.join(dir,`${stamp}-native.jsonl`),checkpoint,{mode:0o600,flag:'wx'});
+    // Keep the entire interrupted native log, including any completed compaction.
+    Object.assign(this.state,{checkpoint,checkpointHash:info.hash,revision:this.state.revision+1,compactionCount:info.compactions,blocked:null});
+    Object.assign(turn,{status:'failed',retryable:true,failurePhase:'compaction_interrupted',recoveredRevision:this.state.revision,recoveredAt:new Date().toISOString()});
+    delete turn.lease;this.save();return info;
+  }
   canRetryWriterConflict(turn, message) {
     const s=this.state;
     if(WRITER_CONFLICT.exec(message)?.[1]!==s.nativeId || !s.nativeId ||
@@ -92,10 +148,10 @@ export class SessionStore {
     const records = suffix.trim().split('\n').map(line => JSON.parse(line));
     const hasUser = records.some(r => r.type === 'response_item' && r.payload?.type === 'message' && r.payload.role === 'user' && r.payload.content?.some(c => typeof c.text === 'string' && c.text.includes(turn.prompt)));
     if (!hasUser) throw new Error('Current user instruction is missing from the checkpoint.');
-    Object.assign(this.state, { nativeId, checkpoint, checkpointHash: info.hash, revision: this.state.revision + 1 });
+    Object.assign(this.state, { nativeId, checkpoint, checkpointHash: info.hash, revision: this.state.revision + 1,compactionCount:info.compactions });
     Object.assign(turn, { status: status === 'completed' ? 'completed' : status === 'interrupted' ? 'cancelled' : 'failed', error: error || null,
       completedAt: new Date().toISOString(), committedRevision: this.state.revision, checkpointHash: info.hash,
-      checkpointRecords: info.records, model, usage: usage || null });
+      checkpointRecords: info.records, compactions:info.compactions,compacting:false, model, usage: usage || null });
     delete turn.lease;
     this.save(); return info;
   }
@@ -111,7 +167,7 @@ export class SessionStore {
   publicState() {
     const s = this.state;
     return { id: s.id, title: s.title, revision: s.revision, nativeId: s.nativeId,
-      checkpointHash: s.checkpointHash, checkpointBytes: Buffer.byteLength(s.checkpoint), blocked: s.blocked,
+      checkpointHash: s.checkpointHash, checkpointBytes: Buffer.byteLength(s.checkpoint), compactionCount:s.compactionCount||0,blocked: s.blocked,
       createdAt: s.createdAt,
       participants: s.participants.filter(p => !p.revoked).map(({ id, name, role }) => ({ id, name, role })),
       turns: s.turns.map(({ lease, ...turn }) => turn) };

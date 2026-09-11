@@ -27,11 +27,11 @@ test('A → B → A preserves native ID, original instructions, tool call/output
   assert.ok(store.state.checkpoint.includes('receipt-7319'));assert.ok(store.state.checkpoint.includes('Correction: use violet'));
   assert.deepEqual(store.state.turns.map(t=>t.account),['A account','B account','A account']);
 });
-test('a summary, rewritten record, wrong native ID and native compaction cannot replace original history',()=>{
+test('a summary, rewritten record, wrong native ID and incomplete compaction cannot replace original history',()=>{
   const original=meta+user('Original exact requirement');
   assert.throws(()=>inspectCheckpoint(meta+user('Summary only'),'native-shared-id',original),/rewritten|omitted/);
   assert.throws(()=>inspectCheckpoint(original,'another-id'),/ID changed/);
-  assert.throws(()=>inspectCheckpoint(original+line({type:'compacted',payload:{message:'summary'}}),'native-shared-id',original),/Compacted/);
+  assert.throws(()=>inspectCheckpoint(original+line({type:'compacted',payload:{message:'summary'}}),'native-shared-id',original),/Incomplete native compaction/);
   assert.throws(()=>inspectCheckpoint(original.slice(0,-1),'native-shared-id'),/Invalid/);
 });
 test('repeated submits are idempotent; crashed active turn blocks replay after restart',async t=>{

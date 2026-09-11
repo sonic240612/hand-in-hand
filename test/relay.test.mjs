@@ -56,7 +56,7 @@ test('invited remote browser and runner share one host session, stream changes, 
   const pair=(await call(relay.url,'/api/pairing',{},guest.token)).data;
   const agent=(await call(relay.url,'/api/agent/pair',{code:pair.code})).data;
   assert.equal((await call(relay.url,'/api/agent/pair',{code:pair.code})).status,403);
-  await call(relay.url,'/api/worker/register',{runnerId:'remote-runner',account:'test-account'},agent.token);
+  await call(relay.url,'/api/worker/register',{runnerId:'remote-runner',protocolVersion:2,account:'test-account'},agent.token);
   const prompt='Keep the original shared session and write via the host.';
   const queued=(await call(relay.url,'/api/turns',{prompt,requestId:'remote-1'},guest.token)).data;
   const repeated=(await call(relay.url,'/api/turns',{prompt,requestId:'remote-1'},guest.token)).data;

@@ -5,6 +5,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { createHost } from '../src/server.mjs';
 import { Workspace } from '../src/workspace.mjs';
+import {digest,LEGACY_COMPACTION_ERROR} from '../src/session.mjs';
+import {nativeId,original,interrupted} from './fixtures/native-session.mjs';
 async function fixture(t){const dir=await mkdtemp(path.join(os.tmpdir(),'hih-host-'));const root=path.join(dir,'workspace');await mkdir(root);await writeFile(path.join(root,'index.html'),'<html><body>Original</body></html>');const host=await createHost({port:0,dataDir:path.join(dir,'state'),workspace:root,allowLocalAgent:false});t.after(async()=>{await host.close();await rm(dir,{recursive:true,force:true});});const call=async(route,p,token)=>{const r=await fetch(host.url+route,{method:p===undefined?'GET':'POST',headers:{'Content-Type':'application/json',...(token?{Authorization:`Bearer ${token}`} : {})},body:p===undefined?undefined:JSON.stringify(p)});return {status:r.status,data:await r.json()};};return {host,call,dir,root};}
 test('invite and pairing are one-use; credentials enforce author, runner, lease and revocation',async t=>{
   const {call}=await fixture(t);
@@ -16,7 +18,7 @@ test('invite and pairing are one-use; credentials enforce author, runner, lease 
   const code=(await call('/api/pairing',{},b.token)).data.code;
   const agent=(await call('/api/agent/pair',{code})).data;
   assert.equal((await call('/api/agent/pair',{code})).status,403);
-  await call('/api/worker/register',{runnerId:'b-runner',account:'B account'},agent.token);
+  await call('/api/worker/register',{runnerId:'b-runner',protocolVersion:2,account:'B account'},agent.token);
   await call('/api/turns',{prompt:'Read original',requestId:'b1'},b.token);
   assert.equal((await call('/api/worker/claim',{runnerId:'forged'},agent.token)).status,409);
   const {job}=(await call('/api/worker/claim',{runnerId:'b-runner'},agent.token)).data;
@@ -62,7 +64,7 @@ test('writer-conflict retry preserves history, is author-only, and is idempotent
   const b=(await call('/api/join',{code:invite.code,name:'B'})).data;
   const code=(await call('/api/pairing',{},b.token)).data.code;
   const agent=(await call('/api/agent/pair',{code})).data;
-  await call('/api/worker/register',{runnerId:'b-runner',account:'B account'},agent.token);
+  await call('/api/worker/register',{runnerId:'b-runner',protocolVersion:2,account:'B account'},agent.token);
   const nativeId='11111111-1111-4111-8111-111111111111';
   const checkpoint=JSON.stringify({type:'session_meta',payload:{id:nativeId}})+'\n';
   const {digest}=await import('../src/session.mjs');
@@ -76,4 +78,41 @@ test('writer-conflict retry preserves history, is author-only, and is idempotent
   const duplicate=await call(`/api/turns/${job.id}/retry`,{},b.token);
   assert.equal(first.status,200);assert.equal(first.data.turn.id,duplicate.data.turn.id);
   assert.equal(host.store.state.turns.length,2);assert.equal(host.store.state.checkpoint,checkpoint);
+});
+
+test('old runners are refused before claiming a turn',async t=>{
+  const {call}=await fixture(t),owner=(await call('/api/bootstrap',{})).data;
+  const code=(await call('/api/pairing',{},owner.token)).data.code;
+  const agent=(await call('/api/agent/pair',{code})).data;
+  const registration={runnerId:'old-runner',account:'A account'};
+  const result=await call('/api/worker/register',registration,agent.token);
+  assert.equal(result.status,409);assert.match(result.data.error,/업데이트/);
+  assert.equal((await call('/api/worker/claim',{runnerId:registration.runnerId},agent.token)).status,409);
+  assert.equal((await call('/api/worker/register',{...registration,protocolVersion:2},agent.token)).status,200);
+});
+
+test('only the failed author runner can recover its checkpoint; replay and revoked credentials are refused',async t=>{
+  const {host,call}=await fixture(t),owner=(await call('/api/bootstrap',{})).data;
+  const invite=(await call('/api/invites',{},owner.token)).data;
+  const b=(await call('/api/join',{code:invite.code,name:'B'})).data;
+  const pair=async token=>(await call('/api/agent/pair',{code:(await call('/api/pairing',{},token)).data.code})).data.token;
+  const ownerAgent=await pair(owner.token),bAgent=await pair(b.token);
+  Object.assign(host.store.state,{nativeId,checkpoint:original,checkpointHash:digest(original),revision:4});host.store.save();
+  const turn=host.store.enqueue(b.member,'Recall the other person.','b1');host.store.claim(b.member.id,'b-runner','B account','b');
+  Object.assign(turn,{status:'running',nativeId,appliedHash:digest(original),appliedRevision:4});host.store.fail(turn,LEGACY_COMPACTION_ERROR);
+  assert.equal((await call('/api/worker/recovery')).status,401);
+  assert.equal((await call('/api/worker/recovery',undefined,b.token)).status,401);
+  assert.deepEqual((await call('/api/worker/recovery',undefined,ownerAgent)).data.turns,[]);
+  assert.deepEqual((await call('/api/worker/recovery',undefined,bAgent)).data.turns,[{id:turn.id,nativeId}]);
+  const payload={turnId:turn.id,checkpoint:original+interrupted()};
+  assert.equal((await call('/api/worker/recovery',payload,ownerAgent)).status,400);
+  assert.equal((await call('/api/worker/recovery',{...payload,checkpoint:original},bAgent)).status,400);
+  assert.ok(host.store.state.blocked);
+  assert.equal((await call('/api/worker/recovery',payload,bAgent)).status,200);
+  assert.equal(host.store.state.blocked,null);assert.equal(host.store.state.checkpoint,payload.checkpoint);
+  assert.equal((await call('/api/worker/recovery',payload,bAgent)).status,400);
+  assert.equal((await call(`/api/turns/${turn.id}/retry`,{},owner.token)).status,403);
+  assert.equal((await call(`/api/turns/${turn.id}/retry`,{},b.token)).status,200);
+  await call(`/api/members/${b.member.id}/revoke`,{},owner.token);
+  assert.equal((await call('/api/worker/recovery',undefined,bAgent)).status,401);
 });

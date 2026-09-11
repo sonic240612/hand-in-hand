@@ -8,6 +8,7 @@ import { CodexRpc } from '../src/codex-rpc.mjs';
 import { runtimeEnvironment, readChatgptTokens } from '../src/codex-runtime.mjs';
 import { runNativeTurn } from '../src/agent.mjs';
 import { digest } from '../src/session.mjs';
+import {nativeId,original,compact,message} from './fixtures/native-session.mjs';
 
 async function fixture(t) {const dir=await mkdtemp(path.join(os.tmpdir(),'hih-runtime-'));t.after(()=>rm(dir,{recursive:true,force:true}));return dir;}
 
@@ -63,4 +64,36 @@ test('runner labels only an explicit resume rejection as safe; a turn-start erro
     assert.equal(failed.p.failurePhase,phase==='thread/resume'?'resume_rejected':undefined);
     assert.equal(requests.some(r=>r.route.endsWith('/applied')),phase==='turn/start');
   }
+});
+
+test('runner persists normal compaction and completion without interrupting the native turn',async t=>{
+  const dir=await fixture(t),calls=[],requests=[],prompt='Recall the project.';
+  const account={type:'chatgpt',email:'anna@example.test',planType:'plus'};
+  class FakeRpc extends EventEmitter {
+    async initialize() {}
+    async close() {this.closed=true;}
+    async request(method,params) {
+      requests.push(method);
+      if(method==='account/read')return {account};
+      if(method==='thread/resume'){this.rollout=params.path;return {thread:{id:nativeId,path:params.path,historyMode:'legacy'},model:'test-model'};}
+      if(method==='turn/start') {
+        this.emit('notification',{method:'turn/started',params:{threadId:nativeId,turn:{id:'turn-1'}}});
+        for(const phase of ['started','completed'])this.emit('notification',{method:`item/${phase}`,params:{threadId:nativeId,item:{id:'compact-1',type:'contextCompaction'}}});
+        await writeFile(this.rollout,original+compact()+message('user',params.input[0].text)+message('assistant','Violet.'));
+        this.emit('notification',{method:'turn/completed',params:{threadId:nativeId,turn:{id:'turn-1',status:'completed'}}});
+        return {turn:{id:'turn-1'}};
+      }
+      throw new Error('Unexpected RPC: '+method);
+    }
+  }
+  const rpc=new FakeRpc();
+  await runNativeTurn({dataDir:dir,job:{id:'compacted-turn',checkpoint:original,nativeId,baseHash:digest(original),baseRevision:1,lease:'lease',authorName:'B',authorId:'b',prompt},
+    accountExpected:{label:'a***@example.test · plus',type:'chatgpt',fingerprint:digest('chatgpt:anna@example.test')},rpcFactory:async()=>rpc,
+    api:async(route,p)=>{if(route.endsWith('/complete'))assert.equal(rpc.closed,true);calls.push({route,p});return {};}});
+  assert.equal(requests.includes('turn/interrupt'),false);
+  assert.deepEqual(calls.filter(c=>c.p.kind==='compaction').map(c=>c.p.status),['started','completed']);
+  assert.equal(calls.some(c=>c.route.endsWith('/fail')),false);
+  const result=calls.find(c=>c.route.endsWith('/complete')).p;
+  assert.equal(result.nativeId,nativeId);assert.equal(result.status,'completed');
+  assert.ok(result.checkpoint.startsWith(original));assert.ok(result.checkpoint.includes('"type":"compacted"'));
 });

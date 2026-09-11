@@ -9,7 +9,7 @@ import { digest, inspectCheckpoint } from './session.mjs';
 import { HOST_TOOLS } from './workspace.mjs';
 
 export const BASE_INSTRUCTIONS = `You are the coding assistant in hand-in-hand, a shared session. Every turn can come from a different participant and use their own account. Continue this SAME native conversation; all preceding user instructions, assistant responses and tool results still apply. Preserve who said what. Later user corrections override earlier user requirements. Respond in Korean unless asked otherwise. Be concise.
-All project files are on the HOST, accessible ONLY through host_list_files, host_read_file, host_write_file and host_validate_file. Your local execution environment is disabled. Never use local shell, local files, external connectors, subagents, or web search. Read existing host files before writing, pass the returned expectedHash, and validate changed files where possible. Do not claim that a check is stronger than what its result states. Do not summarize or replace the preceding session history. Do not invoke compaction. If a capability is unavailable, say so.`;
+All project files are on the HOST, accessible ONLY through host_list_files, host_read_file, host_write_file and host_validate_file. Your local execution environment is disabled. Never use local shell, local files, external connectors, subagents, or web search. Read existing host files before writing, pass the returned expectedHash, and validate changed files where possible. Do not claim that a check is stronger than what its result states. Do not create a handoff summary or replace this conversation with a new one. Native runtime compaction may manage the active context; all participants continue its same persisted state. If a capability is unavailable, say so.`;
 
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 function identity(account) {
@@ -40,7 +40,7 @@ export async function runNativeTurn({ job, accountExpected, api, dataDir, signal
     if(msg.method==='turn/started') nativeTurnId=p.turn?.id;
     if(msg.method==='item/agentMessage/delta') emit({kind:'delta',itemId:p.itemId,delta:p.delta});
     if(msg.method==='item/completed' && p.item?.type==='agentMessage') emit({kind:'message',item:p.item});
-    if(msg.method==='item/started' && p.item?.type==='contextCompaction') {fatal=new Error('세션 압축이 감지되어 동일 기록 검증을 중지했습니다.');interrupt();}
+    if(['item/started','item/completed'].includes(msg.method) && p.item?.type==='contextCompaction') emit({kind:'compaction',status:msg.method==='item/started'?'started':'completed'});
     if(msg.method==='thread/tokenUsage/updated') usage=p.tokenUsage;
     if(msg.method==='turn/completed') {completed=p.turn;finish();}
   });
@@ -112,7 +112,7 @@ export async function runAgent({ host, pair, dataDir=path.resolve('.hih-agent'),
   async function api(route,body) {
     const response=await fetch(host+route,{method:body===undefined?'GET':'POST',headers:{...(token?{Authorization:`Bearer ${token}`} : {}),'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body),signal:AbortSignal.timeout(35_000)});
     const result=await response.json();
-    if(!response.ok) throw new Error(result.error || `Host HTTP ${response.status}`);
+    if(!response.ok) throw Object.assign(new Error(result.error || `Host HTTP ${response.status}`),{status:response.status});
     return result;
   }
   if(pair) {
@@ -131,7 +131,20 @@ export async function runAgent({ host, pair, dataDir=path.resolve('.hih-agent'),
     account=identity((await probe.request('account/read',{refreshToken:false})).account);
   } finally {await probe.close();}
   const runnerId=randomUUID();
-  await api('/api/worker/register',{runnerId,account:account.label,accountType:account.type,accountFingerprint:account.fingerprint,runtime:runtime.userAgent,device:os.hostname()});
+  const register=()=>api('/api/worker/register',{runnerId,protocolVersion:2,account:account.label,accountType:account.type,accountFingerprint:account.fingerprint,runtime:runtime.userAgent,device:os.hostname()});
+  const recover=async()=>{
+    const {turns}=await api('/api/worker/recovery');
+    for(const turn of turns) {
+      // IDs originate from this authenticated participant's host queue, not a supplied file path.
+      if(!/^[0-9a-f-]{36}$/.test(turn.id)) throw new Error('Invalid recovery turn ID.');
+      let checkpoint;
+      try {checkpoint=await readFile(path.join(dataDir,'checkpoints',`${turn.id}.recovery.jsonl`),'utf8');}
+      catch(error){if(error.code==='ENOENT'){log('이 기기에 압축 중단 복구 파일이 없습니다. 오류가 발생한 기기와 데이터 폴더에서 다시 연결하세요.');continue;}throw error;}
+      await api('/api/worker/recovery',{turnId:turn.id,checkpoint});
+      log('중단된 세션 원본을 호스트에 복구했습니다. 브라우저의 다시 실행을 누르세요.');
+    }
+  };
+  await register();await recover();
   log(`Codex 연결 완료: ${account.label}. 같은 세션의 내 차례를 기다립니다.`);
   onReady?.({account});
   while(!signal?.aborted) {
@@ -145,6 +158,7 @@ export async function runAgent({ host, pair, dataDir=path.resolve('.hih-agent'),
     } catch(error) {
       if(signal?.aborted) break;
       log(`실행기: ${error.message}`);
+      if(error.status===409) {try{await register();await recover();}catch(reconnectError){log(`재연결: ${reconnectError.message}`);}}
       await delay(2500);
     }
   }

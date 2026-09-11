@@ -116,9 +116,14 @@ export async function createHost({ port=4317, listen='127.0.0.1', dataDir=path.r
       if(route.startsWith('/api/worker/')) {
         const member=memberFor(req,true),p=await body(req);
         if(route==='/api/worker/register') {
+          if(p.protocolVersion!==2)return json(res,409,{error:'연결 프로그램 업데이트가 필요합니다. git pull 후 실행기를 다시 시작하세요.'});
           if(store.active?.authorId===member.id)throw new Error('활성 턴을 실행 중인 연결을 교체할 수 없습니다.');
           if(typeof p.runnerId!=='string' || typeof p.account!=='string' || p.account.length>200)throw new Error('Invalid runner identity.');
           runners.set(member.id,{...p,lastSeen:Date.now()});broadcast();return json(res,200,{ok:true});
+        }
+        if(route==='/api/worker/recovery' && req.method==='GET')return json(res,200,{turns:store.pendingCompactionRecovery(member.id)});
+        if(route==='/api/worker/recovery' && req.method==='POST') {
+          const result=store.recoverCompaction(member.id,p.turnId,p.checkpoint);broadcast();return json(res,200,{ok:true,...result});
         }
         if(route==='/api/worker/claim') {
           const r=runners.get(member.id);
@@ -137,6 +142,7 @@ export async function createHost({ port=4317, listen='127.0.0.1', dataDir=path.r
           turn.status='running';turn.appliedHash=p.hash;turn.appliedRevision=p.revision;turn.nativeId=p.nativeId;turn.model=p.model;store.save();broadcast();return json(res,200,{ok:true});
         }
         if(match[2]==='event') {
+          if(p.kind==='compaction' && ['started','completed'].includes(p.status)) {turn.compacting=p.status==='started';store.save();broadcast();}
           if(p.kind==='delta' && typeof p.delta==='string')broadcast('delta',{turnId:turn.id,itemId:p.itemId,delta:p.delta.slice(0,20_000)});
           if(p.kind==='message' && p.item?.type==='agentMessage') {
             const item={id:p.item.id,text:String(p.item.text||'').slice(0,150_000),phase:p.item.phase};
@@ -207,7 +213,7 @@ export async function createHost({ port=4317, listen='127.0.0.1', dataDir=path.r
           owner(member);if(store.active)throw new Error('진행 중인 턴을 먼저 중단해 주세요.');
           const p=await body(req);await mkdir(path.join(dataDir,'archives'),{recursive:true});
           await writeFile(path.join(dataDir,'archives',`${store.state.id}.json`),JSON.stringify(store.state),{mode:0o600});
-          Object.assign(store.state,{id:randomUUID(),title:typeof p.title==='string'?p.title.slice(0,80):'새로운 프로젝트',revision:0,nativeId:null,checkpoint:'',checkpointHash:digest(''),turns:[],blocked:null,createdAt:new Date().toISOString()});
+          Object.assign(store.state,{id:randomUUID(),title:typeof p.title==='string'?p.title.slice(0,80):'새로운 프로젝트',revision:0,nativeId:null,checkpoint:'',checkpointHash:digest(''),compactionCount:0,turns:[],blocked:null,createdAt:new Date().toISOString()});
           store.save();broadcast();return json(res,200,{ok:true});
         }
         const revoke=route.match(/^\/api\/members\/([^/]+)\/revoke$/);
