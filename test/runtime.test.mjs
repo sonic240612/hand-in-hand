@@ -8,7 +8,7 @@ import { CodexRpc } from '../src/codex-rpc.mjs';
 import { runtimeEnvironment, readChatgptTokens } from '../src/codex-runtime.mjs';
 import { runNativeTurn } from '../src/agent.mjs';
 import { digest } from '../src/session.mjs';
-import {nativeId,original,compact,message} from './fixtures/native-session.mjs';
+import {nativeId,original,compact,message,line} from './fixtures/native-session.mjs';
 
 async function fixture(t) {const dir=await mkdtemp(path.join(os.tmpdir(),'hih-runtime-'));t.after(()=>rm(dir,{recursive:true,force:true}));return dir;}
 
@@ -96,4 +96,55 @@ test('runner persists normal compaction and completion without interrupting the 
   const result=calls.find(c=>c.route.endsWith('/complete')).p;
   assert.equal(result.nativeId,nativeId);assert.equal(result.status,'completed');
   assert.ok(result.checkpoint.startsWith(original));assert.ok(result.checkpoint.includes('"type":"compacted"'));
+});
+
+test('native runner binds the host environment and exports child history after runtime shutdown',async t=>{
+  const dir=await fixture(t),calls=[],methods=[],childId='22222222-2222-4222-8222-222222222222';
+  const childOriginal=line({type:'session_meta',payload:{id:childId}})+message('user','Child context');
+  const execution={environmentId:'hih-host',cwd:'C:\\SharedProject'};
+  let closed=false,bridgeClosed=false,childPath,parentPath;
+  class FakeRpc extends EventEmitter {
+    async initialize(){}
+    async close(){if(closed)return;closed=true;await writeFile(childPath,childOriginal+message('assistant','Child context retained.'));}
+    async request(method,params){
+      methods.push(method);
+      if(method==='account/read')return {account:{type:'chatgpt',email:'anna@example.test',planType:'plus'}};
+      if(method==='environment/add'){assert.equal(params.environmentId,execution.environmentId);assert.equal(params.execServerUrl,'ws://127.0.0.1:1234/private-test');return {};}
+      if(method==='environment/info')return {};
+      if(method==='thread/resume'){
+        assert.equal(params.sandbox,'workspace-write');assert.equal(params.approvalPolicy,'on-request');assert.match(params.developerInstructions,/host/);
+        if(params.threadId===childId)childPath=params.path;else parentPath=params.path;
+        return {thread:{id:params.threadId,path:params.path,historyMode:'legacy'}};
+      }
+      if(method==='mcpServerStatus/list')return {data:[{tools:{read:{},search:{}}}]};
+      if(method==='skills/list')return {data:[{skills:[{name:'sample'}]}]};
+      if(method==='thread/read')return {thread:{id:childId,path:childPath}};
+      if(method==='turn/start'){
+        assert.deepEqual(params.environments,[{...execution,runtimeWorkspaceRoots:[execution.cwd]}]);
+        assert.ok(methods.indexOf('environment/add')<methods.indexOf('thread/resume'));
+        this.emit('notification',{method:'thread/started',params:{thread:{id:childId,path:null}}});
+        await writeFile(parentPath,original+message('user',params.input[0].text));
+        this.emit('notification',{method:'turn/completed',params:{threadId:nativeId,turn:{id:'t1',status:'completed'}}});
+        return {turn:{id:'t1'}};
+      }
+      throw new Error('Unexpected method '+method);
+    }
+  }
+  await runNativeTurn({dataDir:dir,job:{id:'native-child-turn',checkpoint:original,nativeId,baseHash:digest(original),baseRevision:1,lease:'lease',authorName:'B',authorId:'b',prompt:'Continue',execution,nativeThreads:{[childId]:childOriginal}},
+    accountExpected:{label:'a***@example.test · plus',type:'chatgpt',fingerprint:digest('chatgpt:anna@example.test')},
+    rpcFactory:async options=>{assert.equal(options.loadUserTools,true);return new FakeRpc();},
+    connectExecution:async()=>({url:'ws://127.0.0.1:1234/private-test',close:async()=>{bridgeClosed=true;}}),
+    api:async(route,p)=>{calls.push({route,p});if(route.endsWith('/complete'))assert.ok(closed&&bridgeClosed);return {};}});
+  const result=calls.find(c=>c.route.endsWith('/complete')).p;
+  assert.ok(result.checkpoint.startsWith(original));assert.ok(result.nativeThreads[childId].startsWith(childOriginal));assert.match(result.nativeThreads[childId],/Child context retained/);
+  assert.deepEqual(calls.find(c=>c.p.kind==='capabilities').p.catalog,{native:true,mcpTools:2,skills:1});
+});
+
+test('plugin initialization failure is reported before any native session can run',async t=>{
+  const dir=await fixture(t),calls=[];
+  await assert.rejects(runNativeTurn({dataDir:dir,job:{id:'setup-test',lease:'lease'},rpcFactory:async()=>{throw new Error('Invalid personal MCP config');},
+    api:async(route,p)=>{calls.push({route,p});return {};}}),/MCP config/);
+  assert.equal(calls.filter(c=>c.route.endsWith('/fail')).length,1);
+  assert.equal(calls.find(c=>c.route.endsWith('/fail')).p.failurePhase,'setup_failed');
+  assert.equal(calls.some(c=>c.route.endsWith('/applied')),false);
 });

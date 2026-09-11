@@ -18,7 +18,7 @@ try {
   const prompts=[
     [a,"이 세션의 대화 전용 암호는 violet-orbit-542야. host_read_file로 receipt.json을 읽어서 영수증 값을 기억해. 암호와 영수증을 파일에 새로 쓰지는 말고, 짧게 확인만 해줘."],
     [b,"이전 사람이 말한 대화 전용 암호를 amber-orbit-914로 변경할게. 도구는 쓰지 말고, 이전 암호와 새 암호, 이전 도구 결과의 영수증 값을 세 항목으로 짧게 답해줘."],
-    [a,"앞선 참여자가 변경한 현재 암호와 첫 도구 결과의 영수증을 result.json에 각각 passphrase, receipt로 저장해줘. 새 파일이고, 작성 후 host_validate_file로 검증해. 이전 취소된 암호를 쓰지 마."],
+    [a,"앞선 참여자가 변경한 현재 암호와 첫 도구 결과의 영수증을 result.json에 각각 passphrase, receipt로 저장해줘. 새 파일이고, 이번 연속성 검사는 host_write_file로 작성하고 host_validate_file로 검증해. 다른 도구는 쓰지 마. 이전 취소된 암호를 쓰지 마."],
   ];
   let nativeId;
   for(const [i,[member,prompt]] of prompts.entries()){

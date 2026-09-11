@@ -156,7 +156,7 @@ export class SessionStore {
       baseRevision: this.state.revision, baseHash: this.state.checkpointHash, lease: randomUUID() });
     this.save(); return turn;
   }
-  complete(turn, { checkpoint, nativeId, status, error, model, usage }) {
+  complete(turn, { checkpoint, nativeId, status, error, model, usage, nativeThreads={} }) {
     if (this.active?.id !== turn.id || turn.baseRevision !== this.state.revision || turn.baseHash !== this.state.checkpointHash) throw new Error('Stale turn cannot commit.');
     const info = inspectCheckpoint(checkpoint, this.state.nativeId || nativeId, this.state.checkpoint);
     if (info.nativeId !== nativeId) throw new Error('Native ID does not match the checkpoint.');
@@ -164,7 +164,15 @@ export class SessionStore {
     const records = suffix.trim().split('\n').map(line => JSON.parse(line));
     const hasUser = records.some(r => r.type === 'response_item' && r.payload?.type === 'message' && r.payload.role === 'user' && r.payload.content?.some(c => typeof c.text === 'string' && c.text.includes(turn.prompt)));
     if (!hasUser) throw new Error('Current user instruction is missing from the checkpoint.');
+    if(!nativeThreads||typeof nativeThreads!=='object'||Array.isArray(nativeThreads))throw new Error('Invalid child session archive.');
+    const children={...this.state.nativeThreads};
+    for(const [id,raw] of Object.entries(nativeThreads)) {
+      if(id===nativeId||!/^[0-9a-f-]{36}$/.test(id))throw new Error('Invalid child native session ID.');
+      inspectCheckpoint(raw,id,children[id]||'');children[id]=raw;
+    }
+    if(Object.keys(children).length>32||Object.values(children).reduce((n,raw)=>n+Buffer.byteLength(raw),Buffer.byteLength(checkpoint))>MAX_CHECKPOINT)throw new Error('Native session and child archive size limit exceeded.');
     Object.assign(this.state, { nativeId, checkpoint, checkpointHash: info.hash, revision: this.state.revision + 1,compactionCount:info.compactions });
+    this.state.nativeThreads=children;
     Object.assign(turn, { status: status === 'completed' ? 'completed' : status === 'interrupted' ? 'cancelled' : 'failed', error: error || null,
       completedAt: new Date().toISOString(), committedRevision: this.state.revision, checkpointHash: info.hash,
       checkpointRecords: info.records, compactions:info.compactions,compacting:false, model, usage: usage || null });
@@ -172,6 +180,12 @@ export class SessionStore {
     this.save(); return info;
   }
   fail(turn, message, failurePhase) {
+    if(turn.status==='syncing'&&failurePhase==='setup_failed'&&turn.baseRevision===this.state.revision&&
+      turn.baseHash===this.state.checkpointHash&&digest(this.state.checkpoint)===this.state.checkpointHash&&
+      turn.appliedRevision===undefined&&turn.appliedHash===undefined&&!turn.nativeId&&!turn.tools.length&&!turn.items.length) {
+      Object.assign(turn,{status:'failed',error:message,failurePhase,retryable:true,completedAt:new Date().toISOString()});
+      delete turn.lease;this.save();return;
+    }
     if(turn.status==='syncing' && failurePhase==='resume_rejected' && this.canRetryWriterConflict(turn,message)) {
       Object.assign(turn,{status:'failed',error:message,failurePhase,retryable:true,completedAt:new Date().toISOString()});
       delete turn.lease;this.save();return;
@@ -184,6 +198,7 @@ export class SessionStore {
     const s = this.state;
     return { id: s.id, title: s.title, revision: s.revision, nativeId: s.nativeId,
       checkpointHash: s.checkpointHash, checkpointBytes: Buffer.byteLength(s.checkpoint), compactionCount:s.compactionCount||0,blocked: s.blocked,
+      nativeThreadCount:Object.keys(s.nativeThreads||{}).length,
       createdAt: s.createdAt,
       participants: s.participants.filter(p => !p.revoked).map(({ id, name, role }) => ({ id, name, role })),
       turns: s.turns.map(({ lease, ...turn }) => turn) };

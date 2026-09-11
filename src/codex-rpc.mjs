@@ -2,26 +2,22 @@ import { spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { createInterface } from 'node:readline';
 
+export function tomlValue(value) {
+  if(typeof value==='string'||typeof value==='boolean'||typeof value==='number')return JSON.stringify(value);
+  if(Array.isArray(value))return '['+value.filter(v=>v!==null&&v!==undefined).map(tomlValue).join(', ')+']';
+  if(value&&typeof value==='object')return '{ '+Object.entries(value).filter(([,v])=>v!==null&&v!==undefined).map(([k,v])=>JSON.stringify(k)+' = '+tomlValue(v)).join(', ')+' }';
+  throw new Error('Unsupported Codex configuration value.');
+}
+
 export class CodexRpc extends EventEmitter {
   constructor({ executable = process.env.HIH_CODEX_BIN || 'codex', cwd, env = process.env, config: overrides = {}, argsPrefix = [] } = {}) {
     super();
     this.nextId = 1;
     this.pending = new Map();
-    const config = {
-      'features.shell_tool': false,
-      'features.unified_exec': false,
-      'features.apply_patch_freeform': false,
-      'features.apps': false,
-      'features.plugins': false,
-      'features.shell_snapshot': false,
-      'features.multi_agent': false,
-      'web_search': 'disabled',
-      'mcp_servers': {},
-      ...overrides,
-    };
+    const config = overrides;
     const args = [...argsPrefix, 'app-server', '--stdio'];
     for (const [key, value] of Object.entries(config)) {
-      args.push('-c', `${key}=${JSON.stringify(value)}`);
+      args.push('-c', `${key}=${tomlValue(value)}`);
     }
     this.child = spawn(executable, args, { cwd, env, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
     this.stderr = '';

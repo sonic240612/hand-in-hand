@@ -4,12 +4,17 @@
   "private": true,
   "type": "module",
   "description": "One native Codex session, participant-owned runners, one host workspace.",
-  "engines": { "node": ">=22" },
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "start": "node src/server.mjs",
     "agent": "node src/agent.mjs",
     "relay": "node src/relay.mjs",
     "test": "node --test test/*.test.mjs",
     "test:live": "node test/live-smoke.mjs"
+  },
+  "dependencies": {
+    "ws": "8.21.3"
   }
 }

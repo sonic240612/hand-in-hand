@@ -18,7 +18,7 @@ test('invite and pairing are one-use; credentials enforce author, runner, lease 
   const code=(await call('/api/pairing',{},b.token)).data.code;
   const agent=(await call('/api/agent/pair',{code})).data;
   assert.equal((await call('/api/agent/pair',{code})).status,403);
-  await call('/api/worker/register',{runnerId:'b-runner',protocolVersion:2,account:'B account'},agent.token);
+  await call('/api/worker/register',{runnerId:'b-runner',protocolVersion:3,account:'B account'},agent.token);
   await call('/api/turns',{prompt:'Read original',requestId:'b1'},b.token);
   assert.equal((await call('/api/worker/claim',{runnerId:'forged'},agent.token)).status,409);
   const {job}=(await call('/api/worker/claim',{runnerId:'b-runner'},agent.token)).data;
@@ -64,7 +64,7 @@ test('writer-conflict retry preserves history, is author-only, and is idempotent
   const b=(await call('/api/join',{code:invite.code,name:'B'})).data;
   const code=(await call('/api/pairing',{},b.token)).data.code;
   const agent=(await call('/api/agent/pair',{code})).data;
-  await call('/api/worker/register',{runnerId:'b-runner',protocolVersion:2,account:'B account'},agent.token);
+  await call('/api/worker/register',{runnerId:'b-runner',protocolVersion:3,account:'B account'},agent.token);
   const nativeId='11111111-1111-4111-8111-111111111111';
   const checkpoint=JSON.stringify({type:'session_meta',payload:{id:nativeId}})+'\n';
   const {digest}=await import('../src/session.mjs');
@@ -88,7 +88,7 @@ test('old runners are refused before claiming a turn',async t=>{
   const result=await call('/api/worker/register',registration,agent.token);
   assert.equal(result.status,409);assert.match(result.data.error,/업데이트/);
   assert.equal((await call('/api/worker/claim',{runnerId:registration.runnerId},agent.token)).status,409);
-  assert.equal((await call('/api/worker/register',{...registration,protocolVersion:2},agent.token)).status,200);
+  assert.equal((await call('/api/worker/register',{...registration,protocolVersion:3},agent.token)).status,200);
 });
 
 test('only the failed author runner can recover its checkpoint; replay and revoked credentials are refused',async t=>{

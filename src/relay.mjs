@@ -71,7 +71,7 @@ export async function createRelay({port=4318,listen='127.0.0.1',key,publicUrl,po
           const headers=responseHeaders(JSON.parse(Buffer.from(encoded,'base64url').toString()));
           entry.replied=true;clearTimeout(entry.timer);
           const isStream=headers['content-type']?.startsWith('text/event-stream');
-          entry.timer=setTimeout(()=>finish(entry,504,'중계 응답 시간이 만료되었습니다.'),isStream?600_000:60_000);
+          entry.timer=setTimeout(()=>finish(entry,504,'중계 응답 시간이 만료되었습니다.'),isStream?2_100_000:60_000);
           entry.res.writeHead(status,{...headers,'Cache-Control':'no-store','X-Accel-Buffering':'no'});entry.res.flushHeaders();
           try {await pipeline(req,entry.res);json(res,200,{ok:true});}catch {if(!res.destroyed)json(res,410,{error:'참여자 연결이 끝났습니다.'});}finally{finish(entry);}
           return;

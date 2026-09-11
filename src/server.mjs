@@ -11,6 +11,8 @@ import { runAgent } from './agent.mjs';
 import { connectRelay } from './relay-client.mjs';
 import { relayOrigin } from './relay.mjs';
 import { TailscaleAccess } from './tailscale.mjs';
+import { startHostExec } from './exec-transport.mjs';
+import { Interactions } from './interactions.mjs';
 
 const here=path.dirname(fileURLToPath(import.meta.url));
 const token=()=>randomBytes(32).toString('base64url');
@@ -23,7 +25,7 @@ async function body(req) {
   for await(const chunk of req) {length+=chunk.length;if(length>MAX_CHECKPOINT*2)throw new Error('요청이 너무 큽니다.');chunks.push(chunk);}
   return chunks.length?JSON.parse(Buffer.concat(chunks).toString('utf8')):{};
 }
-export async function createHost({ port=4317, listen='127.0.0.1', dataDir=path.resolve('.hih'), workspace=path.resolve('workspace'), allowLocalAgent=true, relay, tailscale=false }={}) {
+export async function createHost({ port=4317, listen='127.0.0.1', dataDir=path.resolve('.hih'), workspace=path.resolve('workspace'), allowLocalAgent=true, relay, tailscale=false, execFactory=startHostExec }={}) {
   if(relay&&tailscale)throw new Error('Tailscale과 별도 중계 중 하나만 선택하세요.');
   if(relay){relay={...relay,url:relayOrigin(relay.url)};if(!/^[A-Za-z0-9_-]{43,128}$/.test(relay.key||''))throw new Error('유효한 중계 연결 키가 필요합니다.');}
   await mkdir(dataDir,{recursive:true});await mkdir(workspace,{recursive:true});
@@ -38,19 +40,23 @@ export async function createHost({ port=4317, listen='127.0.0.1', dataDir=path.r
   }
   const store=new SessionStore(dataDir),files=new Workspace(workspace),runners=new Map(),streams=new Set();
   const localAgents=new Map();let toolChain=Promise.resolve();
+  const executions=new Map();
+  const closeExecution=async turn=>{const pending=executions.get(turn.id);executions.delete(turn.id);if(pending)try{await(await pending).close();}catch{}};
   let actualPort=port,remoteServer,relayConnection,tailscaleAccess,tailscaleMonitor;
   let remoteAccess={mode:tailscale?'tailscale':relay?'relay':'local',enabled:!!relay,connected:false,url:relay?.url||null,error:null};
   const publicState=()=>{
     const state=store.publicState();
     state.workspaceName=path.basename(workspace);
+    state.toolMode='native-host';
     state.remoteAccess=remoteAccess;
-    state.participants=state.participants.map(p=>{const r=runners.get(p.id);return {...p,runner:r?{device:r.device,account:r.account,accountType:r.accountType,accountFingerprint:r.accountFingerprint,online:Date.now()-r.lastSeen<10_000,error:r.error||null}:null};});
+    state.participants=state.participants.map(p=>{const r=runners.get(p.id);return {...p,runner:r?{device:r.device,catalog:r.catalog||null,account:r.account,accountType:r.accountType,accountFingerprint:r.accountFingerprint,online:Date.now()-r.lastSeen<10_000,error:r.error||null}:null};});
     const fingerprints=state.participants.map(p=>p.runner?.accountFingerprint).filter(Boolean);
     state.distinctAccounts=new Set(fingerprints).size;
     state.sameAccount=fingerprints.length>new Set(fingerprints).size;
     return state;
   };
   const broadcast=(kind='state',data=publicState())=>{const event=`event: ${kind}\ndata: ${JSON.stringify(data)}\n\n`;for(const res of streams){if(res.destroyed||res.writableEnded){streams.delete(res);continue;}if(!res.write(event)){streams.delete(res);res.end();}}};
+  const interactions=new Interactions({ownerId:()=>store.state.participants.find(p=>p.role==='owner'&&!p.revoked)?.id,save:()=>{store.save();broadcast();}});
   function memberFor(req,agent=false) {
     const bearer=req.headers.authorization?.replace(/^Bearer /,'');
     const hash=bearer?digest(bearer):'';
@@ -116,7 +122,7 @@ export async function createHost({ port=4317, listen='127.0.0.1', dataDir=path.r
       if(route.startsWith('/api/worker/')) {
         const member=memberFor(req,true),p=await body(req);
         if(route==='/api/worker/register') {
-          if(p.protocolVersion!==2)return json(res,409,{error:'연결 프로그램 업데이트가 필요합니다. git pull 후 실행기를 다시 시작하세요.'});
+          if(p.protocolVersion!==3)return json(res,409,{error:'연결 프로그램 업데이트가 필요합니다. git pull과 npm ci 후 실행기를 다시 시작하세요.'});
           if(store.active?.authorId===member.id)throw new Error('활성 턴을 실행 중인 연결을 교체할 수 없습니다.');
           if(typeof p.runnerId!=='string' || typeof p.account!=='string' || p.account.length>200)throw new Error('Invalid runner identity.');
           runners.set(member.id,{...p,lastSeen:Date.now()});broadcast();return json(res,200,{ok:true});
@@ -131,7 +137,26 @@ export async function createHost({ port=4317, listen='127.0.0.1', dataDir=path.r
           r.lastSeen=Date.now();
           const turn=store.claim(member.id,r.runnerId,r.account,r.accountFingerprint);
           if(turn)broadcast();
-          return json(res,200,{job:turn?{...turn,checkpoint:store.state.checkpoint,nativeId:store.state.nativeId}:null});
+          return json(res,200,{job:turn?{...turn,nativeThreads:store.state.nativeThreads||{},checkpoint:store.state.checkpoint,nativeId:store.state.nativeId,execution:{environmentId:'hih-host',cwd:files.root}}:null});
+        }
+        const execRoute=route.match(/^\/api\/worker\/turns\/([^/]+)\/exec\/(open|events|send|close)$/);
+        if(execRoute) {
+          const {turn}=turnFor(req,execRoute[1],p);
+          if(turn.cancelRequested&&['open','send'].includes(execRoute[2]))throw new Error('중단이 요청된 실행입니다.');
+          if(execRoute[2]==='open') {
+            if(!executions.has(turn.id))executions.set(turn.id,execFactory({workspace:files.root,dataDir}));
+            await executions.get(turn.id);return json(res,200,{ok:true});
+          }
+          if(execRoute[2]==='close'){await closeExecution(turn);return json(res,200,{ok:true});}
+          const pending=executions.get(turn.id);if(!pending)throw new Error('호스트 실행 환경이 열리지 않았습니다.');
+          const execution=await pending;
+          if(execRoute[2]==='events'){execution.attach(res);return;}
+          await execution.send(p);return json(res,200,{ok:true});
+        }
+        const interactionRoute=route.match(/^\/api\/worker\/turns\/([^/]+)\/interaction\/(open|poll)$/);
+        if(interactionRoute) {
+          const {turn}=turnFor(req,interactionRoute[1],p);
+          return json(res,200,interactionRoute[2]==='open'?interactions.open(turn,p):interactions.poll(turn,p.id));
         }
         const match=route.match(/^\/api\/worker\/turns\/([^/]+)\/(applied|event|tool|heartbeat|complete|fail)$/);
         if(!match)return json(res,404,{error:'Unknown worker route'});
@@ -142,6 +167,16 @@ export async function createHost({ port=4317, listen='127.0.0.1', dataDir=path.r
           turn.status='running';turn.appliedHash=p.hash;turn.appliedRevision=p.revision;turn.nativeId=p.nativeId;turn.model=p.model;store.save();broadcast();return json(res,200,{ok:true});
         }
         if(match[2]==='event') {
+          if(p.kind==='capabilities'&&p.catalog){runners.get(member.id).catalog=p.catalog;broadcast();}
+          if(p.kind==='toolDelta'&&typeof p.delta==='string') {
+            const tool=turn.tools.find(t=>t.nativeItemId===p.itemId);
+            if(tool){tool.args.aggregatedOutput=((tool.args.aggregatedOutput||'')+p.delta).slice(-150_000);broadcast();}
+          }
+          if(p.kind==='nativeTool' && p.item?.id && typeof p.item.type==='string') {
+            const item=p.item,index=turn.tools.findIndex(t=>t.nativeItemId===item.id);
+            const record={nativeItemId:item.id,name:item.type,native:true,location:['commandExecution','fileChange','imageView'].includes(item.type)?'host':'account',args:item,status:p.phase==='completed'?'completed':'pending',at:new Date().toISOString(),result:p.phase==='completed'?{success:!['failed','declined','cancelled'].includes(item.status)&&!item.exitCode&&!item.error,output:item}:undefined};
+            index<0?turn.tools.push(record):turn.tools[index]=record;store.save();broadcast();
+          }
           if(p.kind==='compaction' && ['started','completed'].includes(p.status)) {turn.compacting=p.status==='started';store.save();broadcast();}
           if(p.kind==='delta' && typeof p.delta==='string')broadcast('delta',{turnId:turn.id,itemId:p.itemId,delta:p.delta.slice(0,20_000)});
           if(p.kind==='message' && p.item?.type==='agentMessage') {
@@ -167,11 +202,19 @@ export async function createHost({ port=4317, listen='127.0.0.1', dataDir=path.r
           };
           const promise=toolChain.then(perform);toolChain=promise.catch(()=>{});return json(res,200,await promise);
         }
-        if(match[2]==='complete') {const result=store.complete(turn,p);broadcast();return json(res,200,{ok:true,...result});}
-        if(match[2]==='fail') {store.fail(turn,String(p.error||'세션 저장 실패').slice(0,3000),p.failurePhase);broadcast();return json(res,200,{ok:true});}
+        if(match[2]==='complete') {const result=store.complete(turn,p);interactions.finish(turn);await closeExecution(turn);store.save();broadcast();return json(res,200,{ok:true,...result});}
+        if(match[2]==='fail') {interactions.finish(turn);store.fail(turn,String(p.error||'세션 저장 실패').slice(0,3000),p.failurePhase);await closeExecution(turn);broadcast();return json(res,200,{ok:true});}
       }
       if(route.startsWith('/api/')) {
         const member=memberFor(req);
+        const interaction=route.match(/^\/api\/interactions\/([^/]+)$/);
+        if(interaction) {
+          if(req.method==='GET')return json(res,200,interactions.detail(interaction[1],member.id));
+          if(req.method==='POST') {
+            const turn=store.active;if(!turn)throw new Error('진행 중인 Codex 요청이 없습니다.');
+            interactions.reply(turn,interaction[1],member.id,await body(req));return json(res,200,{ok:true});
+          }
+        }
         if(route==='/api/state')return json(res,200,{...publicState(),me:{id:member.id,name:member.name,role:member.role},canLocalConnect:allowLocalAgent && member.role==='owner' && localRequest,canManageNetwork:member.role==='owner'&&localRequest&&!!tailscaleAccess});
         if(route.startsWith('/api/network/tailscale/')&&req.method==='POST') {
           owner(member);if(!localRequest||!tailscaleAccess)return json(res,403,{error:'호스트 PC에서 Tailscale 연결을 설정하세요.'});
@@ -213,7 +256,7 @@ export async function createHost({ port=4317, listen='127.0.0.1', dataDir=path.r
           owner(member);if(store.active)throw new Error('진행 중인 턴을 먼저 중단해 주세요.');
           const p=await body(req);await mkdir(path.join(dataDir,'archives'),{recursive:true});
           await writeFile(path.join(dataDir,'archives',`${store.state.id}.json`),JSON.stringify(store.state),{mode:0o600});
-          Object.assign(store.state,{id:randomUUID(),title:typeof p.title==='string'?p.title.slice(0,80):'새로운 프로젝트',revision:0,nativeId:null,checkpoint:'',checkpointHash:digest(''),compactionCount:0,turns:[],blocked:null,createdAt:new Date().toISOString()});
+          Object.assign(store.state,{id:randomUUID(),title:typeof p.title==='string'?p.title.slice(0,80):'새로운 프로젝트',revision:0,nativeId:null,checkpoint:'',nativeThreads:{},checkpointHash:digest(''),compactionCount:0,turns:[],blocked:null,createdAt:new Date().toISOString()});
           store.save();broadcast();return json(res,200,{ok:true});
         }
         const revoke=route.match(/^\/api\/members\/([^/]+)\/revoke$/);
@@ -236,7 +279,7 @@ export async function createHost({ port=4317, listen='127.0.0.1', dataDir=path.r
   const server=http.createServer((req,res)=>handle(req,res));
   const monitor=setInterval(()=>{
     const active=store.active;
-    if(active) {const runner=runners.get(active.authorId);if(!runner || Date.now()-runner.lastSeen>45_000){store.fail(active,'실행기 연결이 끊겨 세션 저장을 확인할 수 없습니다.');broadcast();}}
+    if(active) {const runner=runners.get(active.authorId);if(!runner || Date.now()-runner.lastSeen>45_000){interactions.finish(active);store.fail(active,'실행기 연결이 끊겨 세션 저장을 확인할 수 없습니다.');closeExecution(active);broadcast();}}
     for(const res of streams)if(!res.destroyed&&!res.writableEnded)res.write(': heartbeat\n\n');else streams.delete(res);
     broadcast();
   },5000);
@@ -254,7 +297,7 @@ export async function createHost({ port=4317, listen='127.0.0.1', dataDir=path.r
     }
   }
   return {server,store,files,url:`http://127.0.0.1:${actualPort}`,port:actualPort,
-    async close() {clearInterval(monitor);clearInterval(tailscaleMonitor);for(const entry of localAgents.values())entry.controller.abort();await Promise.allSettled([...localAgents.values()].map(entry=>entry.promise));for(const res of streams)res.end();await tailscaleAccess?.close();await relayConnection?.close();if(remoteServer){remoteServer.closeAllConnections();await new Promise(resolve=>remoteServer.close(resolve));}server.closeAllConnections();await new Promise(resolve=>server.close(resolve));try{unlinkSync(lockFile);}catch{}},
+    async close() {clearInterval(monitor);clearInterval(tailscaleMonitor);for(const entry of localAgents.values())entry.controller.abort();await Promise.allSettled([...localAgents.values()].map(entry=>entry.promise));await Promise.allSettled([...executions.values()].map(async p=>(await p).close()));for(const res of streams)res.end();await tailscaleAccess?.close();await relayConnection?.close();if(remoteServer){remoteServer.closeAllConnections();await new Promise(resolve=>remoteServer.close(resolve));}server.closeAllConnections();await new Promise(resolve=>server.close(resolve));try{unlinkSync(lockFile);}catch{}},
   };
 }
 if(process.argv[1] && path.resolve(process.argv[1])===fileURLToPath(import.meta.url)) {

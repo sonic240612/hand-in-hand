@@ -1,7 +1,36 @@
-import { mkdir, readFile } from 'node:fs/promises';
+import { mkdir, readFile, writeFile, lstat, symlink } from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
-import { CodexRpc } from './codex-rpc.mjs';
+import { CodexRpc, tomlValue } from './codex-rpc.mjs';
+
+export const NATIVE_TOOL_CONFIG={
+  features:{shell_tool:true,unified_exec:true,apps:true,plugins:true,multi_agent:true,view_image:true,image_generation:true,browser_use:true,computer_use:true,default_mode_request_user_input:true},
+  web_search:'live',
+};
+export function toolConfiguration(config={}) {
+  const result={...NATIVE_TOOL_CONFIG,features:{...config.features,...NATIVE_TOOL_CONFIG.features}};
+  // Only tool configuration is inherited. Authentication, models, providers,
+  // database paths and permission bypasses are never copied from another home.
+  for(const key of ['mcp_servers','apps','plugins','skills','agents','tools','browser_use','computer_use','marketplaces','hooks','js_repl_node_path','js_repl_node_module_dirs','tool_output_token_limit','include_apps_instructions','mcp_oauth_credentials_store','mcp_optional_startup_grace_ms','mcp_oauth_callback_port','mcp_oauth_callback_url'])if(config[key]!==undefined&&config[key]!==null)result[key]=config[key];
+  return result;
+}
+
+async function prepareTools(options,runtimeHome) {
+  const sourceHome=options.sourceHome||options.env?.CODEX_HOME||process.env.CODEX_HOME||path.join(os.homedir(),'.codex');
+  const source=new CodexRpc({cwd:options.cwd,executable:options.executable,env:{...(options.env||process.env),CODEX_HOME:sourceHome}});
+  let config;
+  try{await source.initialize();config=(await source.request('config/read',{includeLayers:false})).config;}finally{await source.close();}
+  const selected=toolConfiguration(config);
+  // These assets remain on the participant's machine. Session and writer-lock
+  // directories are deliberately absent from this list.
+  for(const name of ['skills','plugins','rules','agents']) {
+    const origin=path.join(sourceHome,name),target=path.join(runtimeHome,name);
+    if(!(await lstat(origin).catch(()=>null)))continue;
+    if(!(await lstat(target).catch(()=>null)))await symlink(origin,target,process.platform==='win32'?'junction':'dir');
+  }
+  await writeFile(path.join(runtimeHome,'config.toml'),Object.entries(selected).map(([key,value])=>JSON.stringify(key)+' = '+tomlValue(value)).join('\n')+'\n',{mode:0o600});
+  return {mcpServers:Object.keys(selected.mcp_servers||{}),plugins:Object.keys(selected.plugins||{}),nativeTools:true};
+}
 
 export function runtimeEnvironment(source, runtimeHome) {
   const env={...source};
@@ -57,6 +86,8 @@ export class CodexRuntime extends CodexRpc {
 }
 
 export async function createCodexRuntime(options) {
-  await mkdir(path.resolve(options.dataDir,'codex-runtime'),{recursive:true,mode:0o700});
-  return new CodexRuntime(options);
+  const runtimeHome=path.resolve(options.dataDir,'codex-runtime');
+  await mkdir(runtimeHome,{recursive:true,mode:0o700});
+  const capabilities=options.loadUserTools?await prepareTools(options,runtimeHome):null;
+  const runtime=new CodexRuntime(options);runtime.toolCapabilities=capabilities;return runtime;
 }
