@@ -9,6 +9,7 @@ import { digest, inspectCheckpoint } from './session.mjs';
 import { HOST_TOOLS } from './workspace.mjs';
 import { connectHostExec } from './exec-transport.mjs';
 import { interactionKind } from './interactions.mjs';
+import { saveReceipt, removeReceipt, flushReceipts } from './completion-receipts.mjs';
 
 export const BASE_INSTRUCTIONS = `You are the coding assistant in hand-in-hand, a shared session. Every turn can come from a different participant and use their own account. Continue this SAME native conversation; all preceding user instructions, assistant responses and tool results still apply. Preserve who said what. Later user corrections override earlier user requirements. Respond in Korean unless asked otherwise. Be concise.
 All project files are on the shared HOST execution environment. Use the selected host environment for shell commands, file edits, tests, builds, and project images. Native Codex tools, web search, installed MCP tools, plugins, skills, and subagents are available according to this participant's account and installed runtime. Personal connectors use this participant's credentials. Respect approval requests and explain unavailable capabilities accurately. Preserve who said what and do not create a new conversation or a handoff summary in place of this session. Native compaction may manage active context while the original session log is retained. This runtime replaces earlier prototype restrictions that allowed only four host_* tools or prohibited native tools. The old host_* tools remain usable for earlier sessions; read before writing with those tools and pass expectedHash.`;
@@ -41,8 +42,25 @@ async function nativeTurn({ job, accountExpected, api, dataDir, signal, executab
   onRuntimeReady();
   let nativeId, rolloutPath, nativeTurnId, completed, fatal, usage,execution,stage='setup';
   const nativeThreads=new Map();
-  let chain = Promise.resolve();
-  const emit = body => { chain = chain.then(()=>api(`/api/worker/turns/${job.id}/event`, {lease:job.lease,...body})); chain.catch(()=>{}); };
+  let chain = Promise.resolve(), eventDeliveryFailed=false, finalEventBytes=0, finalEventError;
+  const finalEvents=new Map();
+  // Live UI delivery is not the native checkpoint commit. Once a delivery
+  // fails, stop this turn's stream without preventing a confirmed completion
+  // from closing its writer and entering the durable receipt outbox.
+  const emit = body => {
+    if(['message','nativeTool'].includes(body.kind)&&body.item?.id&&!finalEventError){
+      const key=body.kind+':'+body.item.id,encoded=JSON.stringify(body),bytes=Buffer.byteLength(encoded);
+      const total=finalEventBytes-(finalEvents.get(key)?.bytes||0)+bytes;
+      const count=finalEvents.size+(finalEvents.has(key)?0:1);
+      if(count>2000||total+count+1>8*1024*1024)finalEventError=new Error('최종 출력 기록 크기 제한을 초과했습니다. 원본 세션 확인이 필요합니다.');
+      else{finalEvents.set(key,{encoded,bytes});finalEventBytes=total;}
+    }
+    chain = chain.then(async()=>{
+    if(eventDeliveryFailed)return;
+    try{await api(`/api/worker/turns/${job.id}/event`, {lease:job.lease,...body});}
+    catch{eventDeliveryFailed=true;}
+    });
+  };
   let finish;
   const done = new Promise(resolve => { finish=resolve; });
   const interrupt = () => { if (nativeId && nativeTurnId) rpc.request('turn/interrupt',{threadId:nativeId,turnId:nativeTurnId}).catch(()=>{}); };
@@ -138,7 +156,7 @@ async function nativeTurn({ job, accountExpected, api, dataDir, signal, executab
     const started=await rpc.request('turn/start',{threadId:nativeId,input:[{type:'text',text}],environments,effort:'low'});
     nativeTurnId=started.turn.id;
     await done;
-    if(fatal) throw fatal;
+    if(fatal&&!completed) throw fatal;
     await chain;
     for(const [id,file] of nativeThreads)if(id!==nativeId&&!file) {
       const child=await rpc.request('thread/read',{threadId:id,includeTurns:false});
@@ -155,8 +173,12 @@ async function nativeTurn({ job, accountExpected, api, dataDir, signal, executab
       if(relative.startsWith('..')||path.isAbsolute(relative))throw new Error('Child checkpoint is outside this runner.');
       const raw=await readFile(file,'utf8');inspectCheckpoint(raw,id,job.nativeThreads?.[id]||'');children[id]=raw;
     }
-    await api(`/api/worker/turns/${job.id}/complete`,{lease:job.lease,nativeId,checkpoint,
-      status:completed.status,error:completed.error?.message || null,model:response.model,usage,nativeThreads:children});
+    if(finalEventError)throw finalEventError;
+    const payload={lease:job.lease,nativeId,checkpoint,status:completed.status,error:completed.error?.message||null,model:response.model,usage,nativeThreads:children,
+      finalEvents:[...finalEvents.values()].map(event=>JSON.parse(event.encoded))};
+    await saveReceipt(dataDir,job.id,payload);
+    await api(`/api/worker/turns/${job.id}/complete`,payload);
+    await removeReceipt(dataDir,job.id);
   } catch(error) {
     error.hihReported=true;
     await Promise.allSettled([rpc.close(),execution?.close()]);
@@ -189,6 +211,7 @@ export async function runAgent({ host, pair, dataDir=path.resolve('.hih-agent'),
     if(saved.host!==host) throw new Error('저장된 연결의 호스트가 다릅니다. 새 연결 코드를 사용하세요.');
     token=saved.token;
   }
+  await flushReceipts(dataDir,api,log);
   const scratch=path.join(dataDir,'empty-workspace');await mkdir(scratch,{recursive:true});
   const probe=await createCodexRuntime({cwd:scratch,executable,dataDir});
   let account,runtime;
@@ -197,7 +220,7 @@ export async function runAgent({ host, pair, dataDir=path.resolve('.hih-agent'),
     account=identity((await probe.request('account/read',{refreshToken:false})).account);
   } finally {await probe.close();}
   const runnerId=randomUUID();
-  const register=()=>api('/api/worker/register',{runnerId,protocolVersion:3,account:account.label,accountType:account.type,accountFingerprint:account.fingerprint,runtime:runtime.userAgent,device:os.hostname()});
+  const register=()=>api('/api/worker/register',{runnerId,protocolVersion:3,features:['completion-receipts'],account:account.label,accountType:account.type,accountFingerprint:account.fingerprint,runtime:runtime.userAgent,device:os.hostname()});
   const recover=async()=>{
     const {turns}=await api('/api/worker/recovery');
     for(const turn of turns) {
@@ -215,6 +238,7 @@ export async function runAgent({ host, pair, dataDir=path.resolve('.hih-agent'),
   onReady?.({account});
   while(!signal?.aborted) {
     try {
+      await flushReceipts(dataDir,api,log);
       const {job}=await api('/api/worker/claim',{runnerId});
       if(job) {
         log(`세션 v${job.baseRevision} → 내 턴 실행`);

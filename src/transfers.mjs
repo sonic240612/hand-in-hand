@@ -11,12 +11,14 @@ export class Transfers {
   async get(id,member){
     if(!/^[0-9a-f-]{36}$/.test(id))throw new Error('잘못된 전송 ID입니다.');
     const info=JSON.parse(await readFile(path.join(this.directory,id+'.json'),'utf8'));
-    if(info.member!==member||info.expires<Date.now())throw new Error('전송 권한이 없거나 만료되었습니다.');return info;
+    if(info.member!==member||info.expires<Date.now()||info.workspaceRoot!==this.files.root)throw new Error('전송 권한이 없거나 작업공간이 변경되었습니다. 파일을 다시 선택하세요.');return info;
   }
   async start(member,{name,size,hash}){
+    const workspaceRoot=this.files.root;
     if(!Number.isInteger(size)||size<0||size>MAX_UPLOAD||!/^[a-f0-9]{64}$/.test(hash||''))throw new Error('파일은 50 MiB 이하이며 SHA-256 검증값이 필요합니다.');
     await this.files.resolve(name,true);await mkdir(this.directory,{recursive:true});
-    const info={id:randomUUID(),member,name,size,hash,offset:0,expires:Date.now()+86400_000,status:'receiving'};
+    if(this.files.root!==workspaceRoot)throw new Error('작업공간이 변경되었습니다. 파일을 다시 선택하세요.');
+    const info={id:randomUUID(),member,workspaceRoot,name,size,hash,offset:0,expires:Date.now()+86400_000,status:'receiving'};
     await writeFile(path.join(this.directory,info.id+'.part'),Buffer.alloc(0),{flag:'wx',mode:0o600});await this.save(info);return info;
   }
   chunk(id,member,{offset,data}){return this.serial(async()=>{

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile, readFile, readdir } from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import { EventEmitter } from 'node:events';
@@ -8,6 +8,7 @@ import { CodexRpc } from '../src/codex-rpc.mjs';
 import { runtimeEnvironment, readChatgptTokens } from '../src/codex-runtime.mjs';
 import { runNativeTurn } from '../src/agent.mjs';
 import { digest } from '../src/session.mjs';
+import { flushReceipts } from '../src/completion-receipts.mjs';
 import {nativeId,original,compact,message,line} from './fixtures/native-session.mjs';
 
 async function fixture(t) {const dir=await mkdtemp(path.join(os.tmpdir(),'hih-runtime-'));t.after(()=>rm(dir,{recursive:true,force:true}));return dir;}
@@ -147,4 +148,58 @@ test('plugin initialization failure is reported before any native session can ru
   assert.equal(calls.filter(c=>c.route.endsWith('/fail')).length,1);
   assert.equal(calls.find(c=>c.route.endsWith('/fail')).p.failurePhase,'setup_failed');
   assert.equal(calls.some(c=>c.route.endsWith('/applied')),false);
+});
+
+test('failed live event delivery cannot discard a completed native checkpoint or its final UI output',async t=>{
+  const root=await fixture(t),execution={environmentId:'hih-host',cwd:'C:\\SharedProject'};
+  for(const loseCompletionResponse of [false,true]){
+    const dir=path.join(root,String(loseCompletionResponse)),calls=[];
+    let closed=false,bridgeClosed=false,rollout,finalCheckpoint,record;
+    class FakeRpc extends EventEmitter {
+      async initialize(){}
+      async close(){if(closed)return;closed=true;if(rollout)await writeFile(rollout,finalCheckpoint);}
+      async request(method,params){
+        if(method==='account/read')return {account:{type:'chatgpt',email:'anna@example.test',planType:'plus'}};
+        if(['environment/add','environment/info'].includes(method))return {};
+        if(['mcpServerStatus/list','skills/list'].includes(method))return {data:[]};
+        if(method==='thread/resume'){rollout=params.path;return {thread:{id:nativeId,path:rollout,historyMode:'legacy'},model:'test-model'};}
+        if(method==='turn/start'){
+          const tool={id:'command-one',type:'commandExecution',status:'inProgress',command:'read-only test'};
+          this.emit('notification',{method:'item/started',params:{threadId:nativeId,item:tool}});
+          this.emit('notification',{method:'item/completed',params:{threadId:nativeId,item:{...tool,status:'completed',exitCode:0,aggregatedOutput:'verified'}}});
+          this.emit('notification',{method:'item/completed',params:{threadId:nativeId,item:{id:'answer-one',type:'agentMessage',text:'Final answer retained.'}}});
+          finalCheckpoint=original+message('user',params.input[0].text)+message('assistant','Final answer retained.');
+          this.emit('notification',{method:'turn/completed',params:{threadId:nativeId,turn:{id:'native-complete',status:'completed'}}});
+          return {turn:{id:'native-complete'}};
+        }
+        throw new Error('Unexpected RPC: '+method);
+      }
+    }
+    const execute=()=>runNativeTurn({dataDir:dir,job:{id:'event-loss-turn',checkpoint:original,nativeId,baseHash:digest(original),baseRevision:1,lease:'lease',authorName:'B',authorId:'b',prompt:'Continue',execution},
+      accountExpected:{label:'a***@example.test · plus',type:'chatgpt',fingerprint:digest('chatgpt:anna@example.test')},rpcFactory:async()=>new FakeRpc(),
+      connectExecution:async()=>({url:'ws://127.0.0.1:1234/private-test',close:async()=>{bridgeClosed=true;}}),
+      api:async(route,p)=>{
+        calls.push({route,p});
+        if(route.endsWith('/event'))throw new Error('live event response lost');
+        if(route.endsWith('/complete')){
+          assert.ok(closed&&bridgeClosed);
+          record=JSON.parse(await readFile(path.join(dir,'receipts','event-loss-turn.json'),'utf8'));
+          assert.equal(record.payload.checkpoint,finalCheckpoint);
+          assert.deepEqual(record.payload,JSON.parse(JSON.stringify(p)));
+          if(loseCompletionResponse)throw new Error('completion response lost');
+        }
+        return {};
+      }});
+    if(loseCompletionResponse)await assert.rejects(execute(),/completion response lost/);else await execute();
+    assert.equal(calls.filter(c=>c.route.endsWith('/event')).length,1);
+    assert.equal(record.payload.nativeId,nativeId);assert.ok(record.payload.checkpoint.startsWith(original));
+    assert.equal(record.payload.finalEvents.length,2);
+    assert.equal(record.payload.finalEvents.find(e=>e.kind==='message').item.text,'Final answer retained.');
+    assert.equal(record.payload.finalEvents.find(e=>e.kind==='nativeTool').phase,'completed');
+    assert.equal(record.payload.finalEvents.find(e=>e.kind==='nativeTool').item.aggregatedOutput,'verified');
+    if(loseCompletionResponse){
+      let sent=false;await flushReceipts(dir,async(route,p)=>{assert.equal(route,'/api/worker/receipt');assert.deepEqual(p,record);sent=true;return {ok:true};});assert.equal(sent,true);
+    }else assert.equal(calls.some(c=>c.route.endsWith('/fail')),false);
+    assert.deepEqual(await readdir(path.join(dir,'receipts')),[]);
+  }
 });

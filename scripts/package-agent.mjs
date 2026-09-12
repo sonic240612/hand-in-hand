@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..');
 const manifest=JSON.parse(await readFile(path.join(root,'package.json'),'utf8'));
 const files=[];
-for(const name of ['agent.mjs','codex-rpc.mjs','codex-runtime.mjs','session.mjs','workspace.mjs','exec-transport.mjs','interactions.mjs'])files.push(['src/'+name,await readFile(path.join(root,'src',name))]);
+for(const name of ['agent.mjs','codex-rpc.mjs','codex-runtime.mjs','session.mjs','workspace.mjs','exec-transport.mjs','interactions.mjs','completion-receipts.mjs'])files.push(['src/'+name,await readFile(path.join(root,'src',name))]);
 files.push(['scripts/doctor.mjs',await readFile(path.join(root,'scripts/doctor.mjs'))]);
 files.push(['package.json',Buffer.from(JSON.stringify({...manifest,scripts:{agent:'node src/agent.mjs',doctor:'node scripts/doctor.mjs'}},null,2))]);
 files.push(['package-lock.json',await readFile(path.join(root,'package-lock.json'))]);

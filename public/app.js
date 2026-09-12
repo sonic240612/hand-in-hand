@@ -1,10 +1,12 @@
 import { projectFeatures } from './project-ui.js';
+import { managementFeatures } from './management-ui.js';
 const $=id=>document.getElementById(id);
 const e=value=>String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-let credential=sessionStorage.getItem('hih-token'),state,me,canLocalConnect=false,canManageNetwork=false,streamController;
+let credential=sessionStorage.getItem('hih-token'),state,me,canLocalConnect=false,canManageNetwork=false,canManageWorkspace=false,streamController;
 let previewHash='',fileStamp='',selectedFile=null,lastFilesRefresh=0,turnsStamp='';
 function download(blob,name){const url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(url),10_000);}
 const features=projectFeatures({api,modal,toast,escape:e,getState:()=>state,getMe:()=>me,refreshFiles,refreshPreview,download});
+const management=managementFeatures({api,modal,toast,escape:e,getState:()=>state,getMe:()=>me,canManageWorkspace:()=>canManageWorkspace});
 const partial=new Map();
 const statusLabels={queued:'차례 대기',syncing:'동일 세션 적용 중',running:'작업 중',completed:'완료',failed:'실패',interrupted:'확인 필요',cancelled:'취소됨'};
 let toastTimer;
@@ -64,6 +66,7 @@ async function openInteraction(id){
   }catch(error){toast(error.message);}
 }
 function render(next){
+  if(state&&state.id!==next.id){partial.clear();pendingSubmission=null;selectedFile=null;previewHash='';$('prompt').value='';}
   state=next;
   $('session-title').textContent=state.title;$('heading').textContent=state.title;$('workspace-name').textContent=state.workspaceName||'workspace';
   $('member-count').textContent=state.participants.length;$('turn-count').textContent=`${state.turns.length}개의 턴`;
@@ -78,13 +81,14 @@ function render(next){
   $('tool-catalog').textContent=catalog?.native?`기본 도구 활성화 · MCP ${catalog.mcpTools??'확인 중'}개 · 스킬 ${catalog.skills??'확인 중'}개 · 하위 세션 ${state.nativeThreadCount||0}개 보관`:'첫 실행에서 내 MCP·스킬을 확인합니다. 기본 셸·파일·웹 검색을 사용할 수 있습니다.';
   $('billing-label').textContent=myRunner?.accountType==='chatgpt'?'내 구독 계정':myRunner?.accountType?'API 계정':'내 계정';
   const warnings=[];
-  if(state.blocked)warnings.push(state.blocked);
+  if(state.blocked)warnings.push(state.blocked+' 완료 원본을 가진 실행기를 같은 --data 경로로 다시 연결하면 저장 확인을 시도합니다.');
+  if(state.closing)warnings.push('호스트가 종료를 준비하고 있습니다. 현재 턴의 저장을 기다리는 중입니다.');
   if(state.sameAccount)warnings.push('두 실행기가 같은 Codex 계정으로 연결되어 있습니다. 세션 교대는 확인할 수 있지만 계정별 할당량 분리 검증은 아닙니다.');
   if(myRunner?.error)warnings.push(myRunner.error);
   $('notice').textContent=warnings.join('\n');$('notice').classList.toggle('hidden',!warnings.length);
   const active=state.turns.find(t=>['running','syncing'].includes(t.status)),queued=state.turns.filter(t=>t.status==='queued');
   $('queue-status').textContent=active?`${active.authorName}의 AI가 ${active.compacting?'이전 원문을 보관하며 컨텍스트를 압축하고 있어요':active.status==='syncing'?'같은 세션을 적용하고 있어요':'작업하고 있어요'}.${queued.length?` 다음 지시 ${queued.length}개 대기 중`:''}`:queued.length?`${queued[0].authorName}의 실행기 연결을 기다리고 있어요.`:'공유 기록을 유지하며 한 차례씩 실행합니다.';
-  $('send').disabled=!!state.blocked||me?.role==='observer';
+  $('send').disabled=!!state.blocked||state.closing||state.workspaceBusy||me?.role==='observer';
   $('revision').textContent=state.revision;$('accounts').textContent=state.distinctAccounts;
   $('native-id').textContent=state.nativeId||'첫 실행 후 생성됩니다';$('checkpoint-hash').textContent=state.revision?state.checkpointHash:'아직 기록이 없습니다';
   $('new-session').classList.toggle('hidden',me?.role!=='owner');
@@ -93,6 +97,7 @@ function render(next){
   const stamp=state.id+':'+state.revision+':'+state.turns.flatMap(t=>t.tools||[]).filter(t=>t.native&&t.status==='completed').map(t=>t.at).join(',')+':'+state.turns.flatMap(t=>t.tools||[]).filter(t=>t.name==='host_write_file'&&t.result?.success).map(t=>t.result.output.hash).join(',');
   if(stamp!==fileStamp||Date.now()-lastFilesRefresh>10_000){fileStamp=stamp;lastFilesRefresh=Date.now();refreshFiles();refreshPreview();}
   features.render(state,me);
+  management.render(state,me);
 }
 function renderTurns(){
   const nextStamp=JSON.stringify([state.turns,[...partial.values()],me.id,state.blocked]);if(nextStamp===turnsStamp)return;turnsStamp=nextStamp;
@@ -119,7 +124,7 @@ async function showFile(name){
 }
 async function refreshPreview(){if(features.devPreview())return;try{const file=await api('/api/file?path=index.html');if(file.hash!==previewHash||!$('preview').hasAttribute('srcdoc')){previewHash=file.hash;const policy="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:; font-src 'none'; connect-src 'none'; form-action 'none'; base-uri 'none'";$('preview').srcdoc=`<!doctype html><meta http-equiv="Content-Security-Policy" content="${policy}">`+file.content;}document.querySelector('.preview-caption span').textContent='index.html';$('preview-version').textContent=`${file.hash.slice(0,8)} · 최신 파일`;}catch{$('preview').srcdoc='<p style="font:12px sans-serif;color:#8c9a80;padding:25px">호스트에 index.html을 만들면 여기에 표시됩니다.</p>';$('preview-version').textContent='index.html 대기';}}
 $('refresh-preview').onclick=()=>{if(features.devPreview())return $('preview-live').onclick();previewHash='';refreshPreview();};
-document.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>{document.querySelectorAll('[data-tab]').forEach(t=>t.classList.toggle('active',t===b));for(const tab of ['preview','files','session'])$('panel-'+tab).classList.toggle('hidden',tab!==b.dataset.tab);});
+document.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>{document.querySelectorAll('[data-tab]').forEach(t=>t.classList.toggle('active',t===b));for(const tab of ['preview','files','session','runtime'])$('panel-'+tab).classList.toggle('hidden',tab!==b.dataset.tab);});
 document.querySelectorAll('[data-prompt]').forEach(b=>b.onclick=()=>{$('prompt').value=b.dataset.prompt;$('prompt').focus();});
 let submitting=false,pendingSubmission=null;
 $('composer').onsubmit=async event=>{event.preventDefault();const prompt=$('prompt').value.trim();if(!prompt||submitting||me?.role==='observer')return;submitting=true;$('send').disabled=true;if(pendingSubmission?.prompt!==prompt)pendingSubmission={prompt,requestId:crypto.randomUUID()};try{await api('/api/turns',pendingSubmission);pendingSubmission=null;$('prompt').value='';$('timeline').scrollTop=$('timeline').scrollHeight;}catch(err){toast(err.message);}finally{submitting=false;$('send').disabled=!!state?.blocked||me?.role==='observer';}};
@@ -157,7 +162,7 @@ async function watch(){
     await new Promise(r=>setTimeout(r,2000));
   }
 }
-async function start(){const initial=await api('/api/state');me=initial.me;canLocalConnect=initial.canLocalConnect;canManageNetwork=initial.canManageNetwork;render(initial);watch();}
+async function start(){const initial=await api('/api/state');me=initial.me;canLocalConnect=initial.canLocalConnect;canManageNetwork=initial.canManageNetwork;canManageWorkspace=initial.canManageWorkspace;render(initial);watch();}
 const invite=new URLSearchParams(location.hash.slice(1)).get('invite');
 if(invite){modal(`<div class="join-brand">↔ hand-in-hand.</div><h2>같은 세션에 참여하기</h2><p>동료의 이전 지시와 AI 작업 결과를 그대로 이어갑니다.</p><form id="join-form"><label for="join-name">함께 작업할 이름</label><input id="join-name" placeholder="이름" required maxlength="30" autocomplete="nickname"><div class="modal-actions"><button class="button primary" type="submit">세션 참여하기</button></div><p class="error-text" id="join-error"></p></form>`);$('join-form').onsubmit=async event=>{event.preventDefault();try{const joined=await api('/api/join',{code:invite,name:$('join-name').value});credential=joined.token;sessionStorage.setItem('hih-token',credential);history.replaceState(null,'',location.pathname);$('modal').close();await start();}catch(err){$('join-error').textContent=err.message;}};
 }else{

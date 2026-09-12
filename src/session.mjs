@@ -4,6 +4,7 @@ import path from 'node:path';
 
 export const digest = text => createHash('sha256').update(text).digest('hex');
 export const MAX_CHECKPOINT = 16 * 1024 * 1024;
+export const completionDigest=p=>digest(JSON.stringify({hash:digest(p.checkpoint),status:p.status,children:Object.entries(p.nativeThreads||{}).sort(([a],[b])=>a.localeCompare(b)).map(([id,raw])=>[id,digest(raw)]),events:digest(JSON.stringify(p.finalEvents||[]))}));
 const WRITER_CONFLICT = /^thread ([0-9a-f-]+) already has an active writer \(-32600\)$/;
 export const LEGACY_COMPACTION_ERROR = '세션 압축이 감지되어 동일 기록 검증을 중지했습니다.';
 export function inspectCheckpoint(text, expectedId = null, previous = '') {
@@ -154,9 +155,10 @@ export class SessionStore {
     if (!turn || turn.authorId !== memberId) return null;
     Object.assign(turn, { status: 'syncing', runnerId, account, accountFingerprint, startedAt: new Date().toISOString(),
       baseRevision: this.state.revision, baseHash: this.state.checkpointHash, lease: randomUUID() });
+    turn.leaseHash=digest(turn.lease);
     this.save(); return turn;
   }
-  complete(turn, { checkpoint, nativeId, status, error, model, usage, nativeThreads={} }) {
+  complete(turn, { checkpoint, nativeId, status, error, model, usage, nativeThreads={},finalEvents=[] }) {
     if (this.active?.id !== turn.id || turn.baseRevision !== this.state.revision || turn.baseHash !== this.state.checkpointHash) throw new Error('Stale turn cannot commit.');
     const info = inspectCheckpoint(checkpoint, this.state.nativeId || nativeId, this.state.checkpoint);
     if (info.nativeId !== nativeId) throw new Error('Native ID does not match the checkpoint.');
@@ -175,6 +177,7 @@ export class SessionStore {
     this.state.nativeThreads=children;
     Object.assign(turn, { status: status === 'completed' ? 'completed' : status === 'interrupted' ? 'cancelled' : 'failed', error: error || null,
       completedAt: new Date().toISOString(), committedRevision: this.state.revision, checkpointHash: info.hash,
+      completionHash:completionDigest({checkpoint,status,nativeThreads,finalEvents}),
       checkpointRecords: info.records, compactions:info.compactions,compacting:false, model, usage: usage || null });
     delete turn.lease;
     this.save(); return info;
@@ -201,6 +204,6 @@ export class SessionStore {
       nativeThreadCount:Object.keys(s.nativeThreads||{}).length,
       createdAt: s.createdAt,
       participants: s.participants.filter(p => !p.revoked).map(({ id, name, role }) => ({ id, name, role })),
-      turns: s.turns.map(({ lease, ...turn }) => turn) };
+      turns: s.turns.map(({ lease, leaseHash, ...turn }) => turn) };
   }
 }
