@@ -103,3 +103,23 @@ test('HTTPS setup guidance survives status polling and enable is not dropped dur
   assert.equal(access.state.setupUrl,'https://login.tailscale.com/admin/dns');
   await access.refresh();assert.match(access.state.error,/HTTPS/);assert.equal(access.state.setupUrl,'https://login.tailscale.com/admin/dns');
 });
+
+test('preview gets its own private Serve port, clears an owned stale endpoint, and follows network shutdown',async t=>{
+  const dir=await temp(t),dataDir=path.join(dir,'state'),workspace=path.join(dir,'workspace');
+  await mkdir(workspace);await mkdir(path.join(dataDir,'preview-network'),{recursive:true});
+  const stale='http://127.0.0.1:5555';
+  await writeFile(path.join(dataDir,'preview-network/tailscale-access.json'),JSON.stringify({dns,port:8444,target:stale}));
+  const fake=cliFixture({TCP:{8444:{HTTPS:true}},Web:{[`${dns}:8444`]:{Handlers:{'/':{Proxy:stale}}}}});
+  const host=await createHost({port:0,dataDir,workspace,allowLocalAgent:false,tailscale:{autoStart:true,execute:fake.execute}});t.after(()=>host.close());
+  assert.ok(fake.calls.some(args=>args.includes('--https=8444')&&args.at(-1)==='off'));
+  const mainTarget=fake.target,owner=(await call(host.url,'/api/bootstrap',{})).data;
+  const enabled=await call(host.url,'/api/preview/config',{port:5173},owner.token);
+  assert.equal(enabled.data.remoteUrl,`https://${dns}:8444`);
+  assert.equal(fake.config.Web[`${dns}:8443`].Handlers['/'].Proxy,mainTarget);
+  assert.notEqual(fake.config.Web[`${dns}:8444`].Handlers['/'].Proxy,mainTarget);
+  const headers={Host:`${dns}:8443`,'Tailscale-User-Login':'test@example.invalid'};
+  const ticket=await call(mainTarget,'/api/preview/open',{},owner.token,headers);
+  assert.ok(ticket.data.url.startsWith(`https://${dns}:8444/__hih/open?ticket=`));
+  await call(host.url,'/api/network/tailscale/disable',{},owner.token);
+  assert.equal(fake.config.TCP[8444],undefined);assert.equal(fake.config.TCP[8443],undefined);
+});

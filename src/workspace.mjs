@@ -25,16 +25,16 @@ export class Workspace {
     }
     return current;
   }
-  async list() {
+  async list(limit = 200) {
     const files = [];
     const walk = async (directory, prefix = '', depth = 0) => {
-      if (depth > 5 || files.length >= 200) return;
+      if (depth > 20 || files.length >= limit) return;
       for (const item of await readdir(directory, { withFileTypes: true })) {
         const name = prefix + item.name;
         if (item.name.startsWith('.') || denied.has(item.name.toLowerCase()) || item.isSymbolicLink()) continue;
         try { await this.resolve(name); } catch { continue; }
         if (item.isDirectory()) await walk(path.join(directory, item.name), name + '/', depth + 1);
-        else if (files.length < 200) files.push({ path: name, bytes: (await lstat(path.join(directory, item.name))).size });
+        else if (files.length < limit) files.push({ path: name, bytes: (await lstat(path.join(directory, item.name))).size });
       }
     };
     await walk(this.root); return files.sort((a,b) => a.path.localeCompare(b.path));

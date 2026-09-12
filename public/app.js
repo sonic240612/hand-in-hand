@@ -1,7 +1,10 @@
+import { projectFeatures } from './project-ui.js';
 const $=id=>document.getElementById(id);
 const e=value=>String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 let credential=sessionStorage.getItem('hih-token'),state,me,canLocalConnect=false,canManageNetwork=false,streamController;
-let previewHash='',fileStamp='',selectedFile=null;
+let previewHash='',fileStamp='',selectedFile=null,lastFilesRefresh=0,turnsStamp='';
+function download(blob,name){const url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(url),10_000);}
+const features=projectFeatures({api,modal,toast,escape:e,getState:()=>state,getMe:()=>me,refreshFiles,refreshPreview,download});
 const partial=new Map();
 const statusLabels={queued:'차례 대기',syncing:'동일 세션 적용 중',running:'작업 중',completed:'완료',failed:'실패',interrupted:'확인 필요',cancelled:'취소됨'};
 let toastTimer;
@@ -64,7 +67,9 @@ function render(next){
   state=next;
   $('session-title').textContent=state.title;$('heading').textContent=state.title;$('workspace-name').textContent=state.workspaceName||'workspace';
   $('member-count').textContent=state.participants.length;$('turn-count').textContent=`${state.turns.length}개의 턴`;
-  $('my-name').textContent=me?.name||'나';$('my-avatar').textContent=(me?.name||'나').slice(0,1);$('my-role').textContent=me?.role==='owner'?'호스트':'참여자';
+  $('my-name').textContent=me?.name||'나';$('my-avatar').textContent=(me?.name||'나').slice(0,1);$('my-role').textContent=me?.role==='owner'?'호스트':me?.role==='observer'?'관찰자':'참여자';
+  $('connect').classList.toggle('hidden',me?.role==='observer');$('composer').classList.toggle('hidden',me?.role==='observer');
+  document.querySelectorAll('.invite-trigger').forEach(b=>b.classList.toggle('hidden',me?.role!=='owner'));
   $('members').innerHTML=state.participants.map(p=>`<div class="member"><span class="avatar ${avatar(p.id)}">${e(p.name.slice(0,1))}</span><div class="member-info"><strong>${e(p.name)}${p.id===me?.id?'<span class="me-badge">나</span>':''}</strong><small>${e(p.runner?.error?'연결 오류':p.runner?.account||'Codex 연결 대기')}</small></div><span class="member-status ${p.runner?.online?'online':''}">${p.runner?.online?'연결됨':'대기'}</span>${me?.role==='owner'&&p.id!==me.id?`<button class="icon-button revoke" data-id="${e(p.id)}" title="참여 권한 회수">×</button>`:''}</div>`).join('');
   document.querySelectorAll('.revoke').forEach(b=>b.onclick=()=>{modal(`<h2>참여 권한 회수</h2><p>이 참여자의 후속 세션 접근과 대기 중인 작업을 차단합니다. 이미 전달된 기록은 회수할 수 없습니다.</p><div class="modal-actions"><button class="button primary" id="confirm-revoke">권한 회수</button></div>`);$('confirm-revoke').onclick=async()=>{try{await api(`/api/members/${b.dataset.id}/revoke`,{});$('modal').close();}catch(err){toast(err.message);}};});
   const myRunner=state.participants.find(p=>p.id===me?.id)?.runner;
@@ -79,16 +84,18 @@ function render(next){
   $('notice').textContent=warnings.join('\n');$('notice').classList.toggle('hidden',!warnings.length);
   const active=state.turns.find(t=>['running','syncing'].includes(t.status)),queued=state.turns.filter(t=>t.status==='queued');
   $('queue-status').textContent=active?`${active.authorName}의 AI가 ${active.compacting?'이전 원문을 보관하며 컨텍스트를 압축하고 있어요':active.status==='syncing'?'같은 세션을 적용하고 있어요':'작업하고 있어요'}.${queued.length?` 다음 지시 ${queued.length}개 대기 중`:''}`:queued.length?`${queued[0].authorName}의 실행기 연결을 기다리고 있어요.`:'공유 기록을 유지하며 한 차례씩 실행합니다.';
-  $('send').disabled=!!state.blocked;
+  $('send').disabled=!!state.blocked||me?.role==='observer';
   $('revision').textContent=state.revision;$('accounts').textContent=state.distinctAccounts;
   $('native-id').textContent=state.nativeId||'첫 실행 후 생성됩니다';$('checkpoint-hash').textContent=state.revision?state.checkpointHash:'아직 기록이 없습니다';
   $('new-session').classList.toggle('hidden',me?.role!=='owner');
   $('network-label').textContent=state.remoteAccess?.mode==='tailscale'?(state.remoteAccess.connected?'Tailscale 연결됨':'Tailscale 설정'):state.remoteAccess?.connected?(new URL(state.remoteAccess.url).protocol==='https:'?'중계 연결됨':'중계 테스트 연결'):state.remoteAccess?.enabled?'중계 재연결 중':'이 PC에서 연결';
   renderTurns();
   const stamp=state.id+':'+state.revision+':'+state.turns.flatMap(t=>t.tools||[]).filter(t=>t.native&&t.status==='completed').map(t=>t.at).join(',')+':'+state.turns.flatMap(t=>t.tools||[]).filter(t=>t.name==='host_write_file'&&t.result?.success).map(t=>t.result.output.hash).join(',');
-  if(stamp!==fileStamp){fileStamp=stamp;refreshFiles();refreshPreview();}
+  if(stamp!==fileStamp||Date.now()-lastFilesRefresh>10_000){fileStamp=stamp;lastFilesRefresh=Date.now();refreshFiles();refreshPreview();}
+  features.render(state,me);
 }
 function renderTurns(){
+  const nextStamp=JSON.stringify([state.turns,[...partial.values()],me.id,state.blocked]);if(nextStamp===turnsStamp)return;turnsStamp=nextStamp;
   const timeline=$('timeline'),atBottom=timeline.scrollHeight-timeline.scrollTop-timeline.clientHeight<100;
   $('empty-state').classList.toggle('hidden',state.turns.length>0);
   $('turns').innerHTML=state.turns.map((turn,index)=>{
@@ -102,21 +109,30 @@ function renderTurns(){
   if(atBottom)timeline.scrollTop=timeline.scrollHeight;
 }
 async function refreshFiles(){try{const result=await api('/api/files');$('file-list').innerHTML=result.files.length?result.files.map(f=>`<button class="file-row" data-file="${e(f.path)}"><span>▤ &nbsp;${e(f.path)}</span><small>${Math.max(1,Math.round(f.bytes/1024))} KB</small></button>`).join(''):'<p class="empty-list">아직 파일이 없습니다.</p>';document.querySelectorAll('[data-file]').forEach(b=>b.onclick=()=>showFile(b.dataset.file));if(selectedFile)showFile(selectedFile);}catch(err){toast(err.message);}}
-async function showFile(name){try{const file=await api('/api/file?path='+encodeURIComponent(name));selectedFile=name;$('file-view').innerHTML=`<strong>${e(name)}</strong><pre>${e(file.content)}</pre><small>SHA-256 ${e(file.hash.slice(0,16))}</small>`;}catch(err){$('file-view').textContent=err.message;}}
-async function refreshPreview(){try{const file=await api('/api/file?path=index.html');if(file.hash!==previewHash){previewHash=file.hash;const policy="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:; font-src 'none'; connect-src 'none'; form-action 'none'; base-uri 'none'";$('preview').srcdoc=`<!doctype html><meta http-equiv="Content-Security-Policy" content="${policy}">`+file.content;}$('preview-version').textContent=`${file.hash.slice(0,8)} · 최신 파일`;}catch{$('preview').srcdoc='<p style="font:12px sans-serif;color:#8c9a80;padding:25px">호스트에 index.html을 만들면 여기에 표시됩니다.</p>';$('preview-version').textContent='index.html 대기';}}
-$('refresh-preview').onclick=()=>{previewHash='';refreshPreview();};
+async function showFile(name){
+  selectedFile=name;$('file-view').innerHTML=`<strong>${e(name)}</strong><button class="button small" id="download-file">다운로드</button><div id="file-content">불러오는 중…</div>`;
+  $('download-file').onclick=async()=>{try{const res=await fetch('/api/download?path='+encodeURIComponent(name),{headers:{Authorization:`Bearer ${credential}`}});if(!res.ok)throw new Error((await res.json()).error);download(await res.blob(),name.split('/').at(-1));}catch(error){toast(error.message);}};
+  try{const file=await api('/api/file?path='+encodeURIComponent(name));if(selectedFile===name)$('file-content').innerHTML=`<pre>${e(file.content)}</pre><small>SHA-256 ${e(file.hash.slice(0,16))}</small>`;}
+  catch(error){if(selectedFile!==name)return;$('file-content').textContent=error.message;
+    if(/\.(png|jpe?g|gif|webp)$/i.test(name)){try{const res=await fetch('/api/download?path='+encodeURIComponent(name),{headers:{Authorization:`Bearer ${credential}`}});if(!res.ok)return;const blob=await res.blob(),url=URL.createObjectURL(blob);if(selectedFile===name){$('file-content').innerHTML=`<img class="artifact-image" src="${url}" alt="${e(name)}">`;$('file-content').querySelector('img').onload=()=>URL.revokeObjectURL(url);}else URL.revokeObjectURL(url);}catch{}}
+  }
+}
+async function refreshPreview(){if(features.devPreview())return;try{const file=await api('/api/file?path=index.html');if(file.hash!==previewHash||!$('preview').hasAttribute('srcdoc')){previewHash=file.hash;const policy="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:; font-src 'none'; connect-src 'none'; form-action 'none'; base-uri 'none'";$('preview').srcdoc=`<!doctype html><meta http-equiv="Content-Security-Policy" content="${policy}">`+file.content;}document.querySelector('.preview-caption span').textContent='index.html';$('preview-version').textContent=`${file.hash.slice(0,8)} · 최신 파일`;}catch{$('preview').srcdoc='<p style="font:12px sans-serif;color:#8c9a80;padding:25px">호스트에 index.html을 만들면 여기에 표시됩니다.</p>';$('preview-version').textContent='index.html 대기';}}
+$('refresh-preview').onclick=()=>{if(features.devPreview())return $('preview-live').onclick();previewHash='';refreshPreview();};
 document.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>{document.querySelectorAll('[data-tab]').forEach(t=>t.classList.toggle('active',t===b));for(const tab of ['preview','files','session'])$('panel-'+tab).classList.toggle('hidden',tab!==b.dataset.tab);});
 document.querySelectorAll('[data-prompt]').forEach(b=>b.onclick=()=>{$('prompt').value=b.dataset.prompt;$('prompt').focus();});
-let submitting=false;
-$('composer').onsubmit=async event=>{event.preventDefault();const prompt=$('prompt').value.trim();if(!prompt||submitting)return;submitting=true;$('send').disabled=true;try{await api('/api/turns',{prompt,requestId:crypto.randomUUID()});$('prompt').value='';$('timeline').scrollTop=$('timeline').scrollHeight;}catch(err){toast(err.message);}finally{submitting=false;$('send').disabled=!!state?.blocked;}};
+let submitting=false,pendingSubmission=null;
+$('composer').onsubmit=async event=>{event.preventDefault();const prompt=$('prompt').value.trim();if(!prompt||submitting||me?.role==='observer')return;submitting=true;$('send').disabled=true;if(pendingSubmission?.prompt!==prompt)pendingSubmission={prompt,requestId:crypto.randomUUID()};try{await api('/api/turns',pendingSubmission);pendingSubmission=null;$('prompt').value='';$('timeline').scrollTop=$('timeline').scrollHeight;}catch(err){toast(err.message);}finally{submitting=false;$('send').disabled=!!state?.blocked||me?.role==='observer';}};
 $('prompt').onkeydown=event=>{if((event.ctrlKey||event.metaKey)&&event.key==='Enter'){$('composer').requestSubmit();event.preventDefault();}};
 async function copy(text){try{await navigator.clipboard.writeText(text);toast('복사했습니다.');}catch{toast('자동 복사가 차단되었습니다. 표시된 내용을 직접 복사하세요.');}}
 document.querySelectorAll('.invite-trigger').forEach(b=>b.onclick=async()=>{try{
   if(me.role!=='owner'){toast('초대 링크는 호스트가 만들 수 있습니다.');return;}
-  const invitation=await api('/api/invites',{});const link=(invitation.url||location.origin)+'/#invite='+encodeURIComponent(invitation.code);
+  const invitation=await api('/api/invites',{});let link=(invitation.url||location.origin)+'/#invite='+encodeURIComponent(invitation.code);
   const remote=invitation.url?.startsWith('https:'),isTailscale=invitation.mode==='tailscale';
   modal(`<div class="eyebrow">BETTER TOGETHER</div><h2>같은 세션으로 초대하기</h2><p>이전 지시와 작업 결과까지 공유합니다.<br>링크는 24시간 동안 한 번 사용할 수 있어요.</p>${isTailscale?'<div class="network-steps"><strong>먼저 Tailscale에서 연결해 주세요</strong><p>참여자도 Tailscale에 로그인해야 합니다. 서로 다른 네트워크 계정이라면 호스트 기기의 공유 초대를 먼저 수락한 뒤 아래 링크를 여세요.</p><a class="text-button" href="https://login.tailscale.com/admin/machines" target="_blank" rel="noopener noreferrer">Tailscale 기기 공유 관리 ↗</a></div>':''}<label for="invite-link">${isTailscale?'Tailscale 사설 초대 링크':'초대 링크'}</label><input id="invite-link" value="${e(link)}" readonly><div class="modal-actions"><button class="button primary" id="copy-invite">초대 링크 복사</button></div><p class="small-note">${isTailscale?'이 링크만으로 Tailscale 기기 접근 권한까지 발급되지는 않습니다. 링크를 받은 사람에게 세션 참여 권한을 주므로 초대할 사람에게만 전달하세요.':remote?'링크를 받은 사람이 참여 권한을 얻으므로 초대할 사람에게만 전달하세요.':'이 주소는 로컬 연결 주소입니다. 127.0.0.1 링크는 이 PC에서만 열립니다.'} 내 Codex 사용에는 hand-in-hand 연결 프로그램이 필요합니다.</p>`);
   $('copy-invite').onclick=()=>copy(link);
+  $('invite-link').insertAdjacentHTML('beforebegin','<label for="invite-role">초대 권한</label><select id="invite-role"><option value="member">작업 참여자 · 내 AI로 지시</option><option value="observer">관찰자 · 기록과 결과만 보기</option></select>');
+  $('invite-role').onchange=async()=>{try{$('copy-invite').disabled=true;const next=await api('/api/invites',{role:$('invite-role').value});link=(next.url||location.origin)+'/#invite='+encodeURIComponent(next.code);$('invite-link').value=link;$('copy-invite').disabled=false;}catch(error){toast(error.message);}};
 }catch(err){toast(err.message);}});
 async function pairingDialog(){const result=await api('/api/pairing',{}),agentHost=state.remoteAccess?.connected?state.remoteAccess.url:location.origin;modal(`<div class="eyebrow">YOUR ACCOUNT, OUR SESSION</div><h2>내 기기의 Codex 연결</h2><p>내 컴퓨터에서 공식 Codex에 로그인한 뒤 연결 프로그램을 실행하세요. 인증 정보는 내 기기에 남습니다.</p><div class="connection-code">${e(result.code.slice(0,6))} ${e(result.code.slice(6))}</div><div class="command">npm run agent -- --host ${e(agentHost)}</div><p>프로그램이 연결 코드를 물으면 위 코드를 입력하세요.</p><div class="modal-actions"><button class="button" id="copy-code">코드 복사</button><button class="button primary" id="pair-done">확인</button></div><p class="small-note">${state.remoteAccess?.mode==='tailscale'?'이 기기도 Tailscale로 호스트에 연결되어 있어야 합니다. ':''}코드는 10분 동안 한 번만 사용합니다. 이 프로토타입은 Node.js 22 이상과 Codex CLI가 필요합니다. 처음 설치하거나 업데이트했다면 npm ci를 먼저 실행하세요.</p>`);$('copy-code').onclick=()=>copy(result.code);$('pair-done').onclick=()=>$('modal').close();}
 function networkDialog(){
