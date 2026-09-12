@@ -1,17 +1,22 @@
 import { projectFeatures } from './project-ui.js';
 import { managementFeatures } from './management-ui.js';
+import { ComposerJournal, BrowserCredentials } from './client-state.js';
+import { conversationSearch } from './search-ui.js';
 const $=id=>document.getElementById(id);
 const e=value=>String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-let credential=sessionStorage.getItem('hih-token'),state,me,canLocalConnect=false,canManageNetwork=false,canManageWorkspace=false,streamController;
+const credentials=new BrowserCredentials(sessionStorage,localStorage);
+let credential=credentials.read(),state,me,canLocalConnect=false,canManageNetwork=false,canManageWorkspace=false,streamController;
+let connected=false,journal,submitting=false,submissionError='',submissionPermanent=false,lastJournalError='',starting=false;
 let previewHash='',fileStamp='',selectedFile=null,lastFilesRefresh=0,turnsStamp='';
 function download(blob,name){const url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(url),10_000);}
 const features=projectFeatures({api,modal,toast,escape:e,getState:()=>state,getMe:()=>me,refreshFiles,refreshPreview,download});
 const management=managementFeatures({api,modal,toast,escape:e,getState:()=>state,getMe:()=>me,canManageWorkspace:()=>canManageWorkspace});
+const search=conversationSearch({getState:()=>state});
 const partial=new Map();
 const statusLabels={queued:'차례 대기',syncing:'동일 세션 적용 중',running:'작업 중',completed:'완료',failed:'실패',interrupted:'확인 필요',cancelled:'취소됨'};
 let toastTimer;
 function toast(message){$('toast').textContent=message;$('toast').classList.remove('hidden');clearTimeout(toastTimer);toastTimer=setTimeout(()=>$('toast').classList.add('hidden'),4500);}
-async function api(route,body){const res=await fetch(route,{method:body===undefined?'GET':'POST',headers:{...(credential?{Authorization:`Bearer ${credential}`} : {}),'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body)});const data=await res.json();if(!res.ok)throw new Error(data.error||'연결에 실패했습니다.');return data;}
+async function api(route,body,signal){const timeout=AbortSignal.timeout(12000);const res=await fetch(route,{method:body===undefined?'GET':'POST',headers:{...(credential?{Authorization:`Bearer ${credential}`} : {}),'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body),signal:signal?AbortSignal.any([signal,timeout]):timeout});const data=await res.json();if(!res.ok)throw Object.assign(new Error(data.error||'연결에 실패했습니다.'),{status:res.status});return data;}
 function modal(html){$('modal-body').innerHTML=html;if(!$('modal').open)$('modal').showModal();}
 $('close-modal').onclick=()=>$('modal').close();
 $('modal').addEventListener('click',event=>{if(event.target===$('modal'))$('modal').close();});
@@ -66,8 +71,10 @@ async function openInteraction(id){
   }catch(error){toast(error.message);}
 }
 function render(next){
-  if(state&&state.id!==next.id){partial.clear();pendingSubmission=null;selectedFile=null;previewHash='';$('prompt').value='';}
+  const changed=state?.id!==next.id||journal?.memberId!==me.id||journal?.sessionId!==next.id;
+  if(changed){partial.clear();selectedFile=null;previewHash='';submissionError='';submissionPermanent=false;try{journal=new ComposerJournal(sessionStorage,next.id,me.id);$('prompt').value=journal.data.text;}catch(error){journal=null;toast('브라우저의 지시 저장을 확인할 수 없습니다: '+error.message);}}
   state=next;
+  try{if(journal?.reconcile(state.turns)){$('prompt').value=journal.data.text;submissionError='';}}catch(error){toast(error.message);}
   $('session-title').textContent=state.title;$('heading').textContent=state.title;$('workspace-name').textContent=state.workspaceName||'workspace';
   $('member-count').textContent=state.participants.length;$('turn-count').textContent=`${state.turns.length}개의 턴`;
   $('my-name').textContent=me?.name||'나';$('my-avatar').textContent=(me?.name||'나').slice(0,1);$('my-role').textContent=me?.role==='owner'?'호스트':me?.role==='observer'?'관찰자':'참여자';
@@ -88,7 +95,7 @@ function render(next){
   $('notice').textContent=warnings.join('\n');$('notice').classList.toggle('hidden',!warnings.length);
   const active=state.turns.find(t=>['running','syncing'].includes(t.status)),queued=state.turns.filter(t=>t.status==='queued');
   $('queue-status').textContent=active?`${active.authorName}의 AI가 ${active.compacting?'이전 원문을 보관하며 컨텍스트를 압축하고 있어요':active.status==='syncing'?'같은 세션을 적용하고 있어요':'작업하고 있어요'}.${queued.length?` 다음 지시 ${queued.length}개 대기 중`:''}`:queued.length?`${queued[0].authorName}의 실행기 연결을 기다리고 있어요.`:'공유 기록을 유지하며 한 차례씩 실행합니다.';
-  $('send').disabled=!!state.blocked||state.closing||state.workspaceBusy||me?.role==='observer';
+  renderDelivery();
   $('revision').textContent=state.revision;$('accounts').textContent=state.distinctAccounts;
   $('native-id').textContent=state.nativeId||'첫 실행 후 생성됩니다';$('checkpoint-hash').textContent=state.revision?state.checkpointHash:'아직 기록이 없습니다';
   $('new-session').classList.toggle('hidden',me?.role!=='owner');
@@ -98,6 +105,8 @@ function render(next){
   if(stamp!==fileStamp||Date.now()-lastFilesRefresh>10_000){fileStamp=stamp;lastFilesRefresh=Date.now();refreshFiles();refreshPreview();}
   features.render(state,me);
   management.render(state,me);
+  search.render(state);
+  if(connected&&!submissionPermanent&&journal?.data.pending)queueMicrotask(()=>deliverPending());
 }
 function renderTurns(){
   const nextStamp=JSON.stringify([state.turns,[...partial.values()],me.id,state.blocked]);if(nextStamp===turnsStamp)return;turnsStamp=nextStamp;
@@ -125,9 +134,32 @@ async function showFile(name){
 async function refreshPreview(){if(features.devPreview())return;try{const file=await api('/api/file?path=index.html');if(file.hash!==previewHash||!$('preview').hasAttribute('srcdoc')){previewHash=file.hash;const policy="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:; font-src 'none'; connect-src 'none'; form-action 'none'; base-uri 'none'";$('preview').srcdoc=`<!doctype html><meta http-equiv="Content-Security-Policy" content="${policy}">`+file.content;}document.querySelector('.preview-caption span').textContent='index.html';$('preview-version').textContent=`${file.hash.slice(0,8)} · 최신 파일`;}catch{$('preview').srcdoc='<p style="font:12px sans-serif;color:#8c9a80;padding:25px">호스트에 index.html을 만들면 여기에 표시됩니다.</p>';$('preview-version').textContent='index.html 대기';}}
 $('refresh-preview').onclick=()=>{if(features.devPreview())return $('preview-live').onclick();previewHash='';refreshPreview();};
 document.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>{document.querySelectorAll('[data-tab]').forEach(t=>t.classList.toggle('active',t===b));for(const tab of ['preview','files','session','runtime'])$('panel-'+tab).classList.toggle('hidden',tab!==b.dataset.tab);});
-document.querySelectorAll('[data-prompt]').forEach(b=>b.onclick=()=>{$('prompt').value=b.dataset.prompt;$('prompt').focus();});
-let submitting=false,pendingSubmission=null;
-$('composer').onsubmit=async event=>{event.preventDefault();const prompt=$('prompt').value.trim();if(!prompt||submitting||me?.role==='observer')return;submitting=true;$('send').disabled=true;if(pendingSubmission?.prompt!==prompt)pendingSubmission={prompt,requestId:crypto.randomUUID()};try{await api('/api/turns',pendingSubmission);pendingSubmission=null;$('prompt').value='';$('timeline').scrollTop=$('timeline').scrollHeight;}catch(err){toast(err.message);}finally{submitting=false;$('send').disabled=!!state?.blocked||me?.role==='observer';}};
+document.querySelectorAll('[data-prompt]').forEach(b=>b.onclick=()=>{$('prompt').value=b.dataset.prompt;saveDraft();$('prompt').focus();});
+$('prompt').maxLength=20000;
+$('composer').insertAdjacentHTML('afterend','<div class="delivery-status"><span id="delivery-status" role="status"></span><button class="text-button hidden" id="retry-submit">접수 다시 확인</button></div>');
+document.querySelector('.session-header').insertAdjacentHTML('beforebegin','<div class="connection-banner" id="connection-banner"><span id="connection-message" role="status">공유 세션에 연결하고 있습니다.</span><button class="text-button" id="reconnect-browser">다시 연결</button></div>');
+$('panel-session').insertAdjacentHTML('beforeend','<div class="detail-label">이 브라우저의 연결</div><label class="remember-setting"><input type="checkbox" id="remember-device"> 이 기기에서 연결 기억</label><p class="small-note">내 기기에서만 선택하세요. 브라우저를 닫았다 열어도 같은 참여자로 연결합니다.</p><button class="button small" id="forget-browser">이 브라우저에서 연결 해제</button>');
+function saveDraft(){try{journal?.edit($('prompt').value);lastJournalError='';}catch(error){if(lastJournalError!==error.message){lastJournalError=error.message;toast('지시 임시 저장 실패: '+error.message);}}renderDelivery();}
+$('prompt').addEventListener('input',saveDraft);
+function renderDelivery(){
+  if(!$('delivery-status'))return;const pending=journal?.data.pending;
+  $('delivery-status').textContent=submissionError|| (pending?(submitting?'지시 접수를 확인하고 있습니다.':connected?'접수 여부 확인 대기':'연결되면 같은 세션에 전송합니다.') :journal?.data.text?'작성 중인 지시를 이 탭에 저장했습니다.':'');
+  $('retry-submit').classList.toggle('hidden',!pending||submitting);$('retry-submit').disabled=!connected;
+  $('send').disabled=!credential||!journal||submitting||!!pending||!!state?.blocked||state?.closing||state?.workspaceBusy||me?.role==='observer';
+  $('prompt').disabled=!credential||!journal||me?.role==='observer';
+}
+async function deliverPending(){
+  if(submitting||!connected||!journal?.data.pending||state?.blocked||state?.workspaceBusy||state?.closing)return;
+  const current=journal,pending=current.data.pending,requestCredential=credential;submitting=true;renderDelivery();
+  try{await api('/api/turns',pending);current.acknowledge(pending.requestId);if(journal===current){$('prompt').value=current.data.text;submissionError='';}$('timeline').scrollTop=$('timeline').scrollHeight;}
+  catch(error){if(journal===current&&current.data.pending){submissionPermanent=!!error.status&&error.status<500&&![408,429].includes(error.status);submissionError=submissionPermanent?error.message:'호스트의 접수 응답을 확인하지 못했습니다. 전송 기록을 보관 중입니다.';}if(journal===current&&credential===requestCredential&&[401,403].includes(error.status))connectionDenied(error.message);}
+  finally{submitting=false;renderDelivery();}
+}
+$('retry-submit').onclick=()=>{submissionError='';submissionPermanent=false;deliverPending();};
+$('composer').onsubmit=async event=>{event.preventDefault();if(!journal||submitting||journal.data.pending||me?.role==='observer'||state?.blocked||state?.closing)return;try{journal.edit($('prompt').value);journal.prepare();submissionError='';renderDelivery();await deliverPending();}catch(error){toast(error.message);}};
+$('remember-device').onchange=()=>{try{credentials.set(credential,$('remember-device').checked);toast($('remember-device').checked?'이 기기에서 연결을 기억합니다.':'연결은 이 탭에서만 유지됩니다.');}catch(error){$('remember-device').checked=false;toast('기기 저장 실패: '+error.message);}};
+$('forget-browser').onclick=()=>{credentials.clear();credential=null;streamController?.abort();connected=false;setConnection(false,'이 브라우저의 연결을 해제했습니다. 초대 링크 또는 다시 연결로 참여하세요.');toast('브라우저에 저장한 접속 정보를 지웠습니다.');};
+$('reconnect-browser').onclick=async()=>{streamController?.abort();while(starting)await new Promise(resolve=>setTimeout(resolve,10));start().catch(error=>showStartError(error));};
 $('prompt').onkeydown=event=>{if((event.ctrlKey||event.metaKey)&&event.key==='Enter'){$('composer').requestSubmit();event.preventDefault();}};
 async function copy(text){try{await navigator.clipboard.writeText(text);toast('복사했습니다.');}catch{toast('자동 복사가 차단되었습니다. 표시된 내용을 직접 복사하세요.');}}
 document.querySelectorAll('.invite-trigger').forEach(b=>b.onclick=async()=>{try{
@@ -153,18 +185,32 @@ $('network').onclick=networkDialog;
 $('connect').onclick=async()=>{try{if(canLocalConnect){modal(`<div class="eyebrow">YOUR ACCOUNT, OUR SESSION</div><h2>내 Codex로 연결하기</h2><p>이 PC의 공식 Codex 로그인으로 실행합니다. 여기서 보낸 지시는 해당 계정의 사용량을 사용해요.</p><div class="modal-actions"><button class="button primary" id="local-connect">이 PC의 Codex 연결</button><button class="button" id="remote-connect">다른 기기 연결</button></div>`);$('local-connect').onclick=async()=>{try{await api('/api/local-agent',{});$('modal').close();toast('Codex 로그인 상태를 확인하고 있습니다.');}catch(err){toast(err.message);}};$('remote-connect').onclick=()=>pairingDialog().catch(err=>toast(err.message));}else await pairingDialog();}catch(err){toast(err.message);}};
 $('guide').onclick=()=>modal(`<div class="eyebrow">A → B → A</div><h2>대화를 이어가 보세요</h2><ol><li>내 Codex를 연결하고 첫 지시를 입력합니다.</li><li>초대 링크로 동료가 같은 세션에 참여합니다.</li><li>동료가 자신의 기기에서 Codex를 연결합니다.</li><li>동료가 “방금 정한 조건대로 수정해줘”라고 지시합니다.</li><li>내가 다시 이어서 요청하면 동료의 작업까지 적용됩니다.</li></ol><p>오른쪽 ‘세션 기록’에서 동일 Codex 세션 ID와 원본 버전을 확인하세요.</p><p class="small-note">새 세션은 원본 기록을 보관한 뒤 별도로 시작합니다. 기본 공유 폴더는 workspace입니다. 셸·파일 작업은 호스트에서 실행하고 승인과 질문은 대화에서 응답합니다. 오른쪽에서는 텍스트 파일과 단일 HTML 미리보기를 확인할 수 있습니다.</p>`);
 $('new-session').onclick=()=>{modal(`<h2>새 세션 시작하기</h2><p>현재 세션은 호스트의 archives 폴더에 보관합니다. 프로젝트 파일은 유지됩니다.</p><label for="new-title">세션 이름</label><input id="new-title" value="새로운 프로젝트" maxlength="80"><div class="modal-actions"><button class="button primary" id="create-session">새 세션 만들기</button></div>`);$('create-session').onclick=async()=>{try{await api('/api/session/new',{title:$('new-title').value});partial.clear();$('modal').close();toast('새 세션을 시작했습니다.');}catch(err){toast(err.message);}};};
+function setConnection(online,message){connected=online;$('connection-status').textContent=online?'연결됨':'재연결 대기';$('connection-message').textContent=message;$('connection-banner').classList.toggle('connected',online);if(!credential)$('remember-device').checked=false;$('remember-device').disabled=!credential;$('forget-browser').disabled=!credential;renderDelivery();}
+function connectionDenied(message){streamController?.abort();credentials.clear();credential=null;setConnection(false,message+' 초대 링크로 다시 참여해 주세요.');}
+function reconnectPause(ms,signal){return new Promise(resolve=>{if(signal.aborted)return resolve();const finish=()=>{clearTimeout(timer);signal.removeEventListener('abort',finish);resolve();},timer=setTimeout(finish,ms);signal.addEventListener('abort',finish,{once:true});});}
 async function watch(){
-  streamController?.abort();streamController=new AbortController();
-  while(!streamController.signal.aborted){
-    try{const response=await fetch('/api/events',{headers:{Authorization:`Bearer ${credential}`},signal:streamController.signal});if(!response.ok)throw new Error('세션 연결 권한을 확인하세요.');$('connection-status').textContent='연결됨';const reader=response.body.getReader(),decoder=new TextDecoder();let buffer='';
-      for(;;){const {value,done}=await reader.read();if(done)break;buffer+=decoder.decode(value,{stream:true});let index;while((index=buffer.indexOf('\n\n'))>=0){const block=buffer.slice(0,index);buffer=buffer.slice(index+2);const kind=block.match(/^event: (.+)$/m)?.[1],raw=block.match(/^data: (.+)$/m)?.[1];if(!raw)continue;const data=JSON.parse(raw);if(kind==='state')render(data);if(kind==='delta'){const key=data.turnId+':'+data.itemId;const item=partial.get(key)||{turnId:data.turnId,id:data.itemId,text:''};item.text+=data.delta;partial.set(key,item);if(state)renderTurns();}}}
-    }catch(error){if(streamController.signal.aborted)return;$('connection-status').textContent='재연결 중';}
-    await new Promise(r=>setTimeout(r,2000));
+  streamController?.abort();const lifecycle=new AbortController();streamController=lifecycle;let attempt=0;
+  setConnection(false,'공유 세션에 연결하고 있습니다. 작성 중인 지시는 보존됩니다.');
+  while(!lifecycle.signal.aborted){
+    const channel=new AbortController();let watchdog,reader;
+    const touch=()=>{clearTimeout(watchdog);watchdog=setTimeout(()=>channel.abort(),20000);};touch();
+    try{const response=await fetch('/api/events',{headers:{Authorization:`Bearer ${credential}`},signal:AbortSignal.any([lifecycle.signal,channel.signal])});if(!response.ok)throw Object.assign(new Error('세션 연결 권한을 확인하세요.'),{status:response.status});reader=response.body.getReader();const decoder=new TextDecoder();let buffer='';
+      for(;;){const {value,done}=await reader.read();if(done)break;touch();buffer+=decoder.decode(value,{stream:true});let index;while((index=buffer.indexOf('\n\n'))>=0){const block=buffer.slice(0,index);buffer=buffer.slice(index+2);const kind=block.match(/^event: (.+)$/m)?.[1],raw=block.match(/^data: (.+)$/m)?.[1];if(!raw)continue;const data=JSON.parse(raw);if(kind==='state'){attempt=0;setConnection(true,'공유 세션 연결됨 · 지시와 결과를 실시간으로 확인합니다.');render(data);}if(kind==='delta'){const key=data.turnId+':'+data.itemId;const item=partial.get(key)||{turnId:data.turnId,id:data.itemId,text:''};item.text+=data.delta;partial.set(key,item);if(state){renderTurns();features.render(state,me);management.render(state,me);search.render(state);}}}}
+    }catch(error){if(lifecycle.signal.aborted)return;if([401,403].includes(error.status)){connectionDenied(error.message);return;}}
+    finally{clearTimeout(watchdog);channel.abort();await reader?.cancel().catch(()=>{});}
+    if(lifecycle.signal.aborted)return;const seconds=Math.min(10,2**attempt++);setConnection(false,`호스트 연결이 끊겼습니다. ${seconds}초 후 다시 연결합니다. 지시와 전송 기록은 보존됩니다.`);await reconnectPause(seconds*1000,lifecycle.signal);
   }
 }
-async function start(){const initial=await api('/api/state');me=initial.me;canLocalConnect=initial.canLocalConnect;canManageNetwork=initial.canManageNetwork;canManageWorkspace=initial.canManageWorkspace;render(initial);watch();}
+function showStartError(error){setConnection(false,error.message||'호스트에 연결할 수 없습니다.');if([401,403].includes(error.status))connectionDenied(error.message);}
+async function start(){
+  if(starting)return;starting=true;streamController?.abort();const startup=new AbortController();streamController=startup;let attempt=0;
+  try{while(!startup.signal.aborted){try{
+    if(!credential){const result=await api('/api/bootstrap',{},startup.signal);startup.signal.throwIfAborted();credential=result.token;credentials.set(credential);}
+    const initial=await api('/api/state',undefined,startup.signal);startup.signal.throwIfAborted();me=initial.me;canLocalConnect=initial.canLocalConnect;canManageNetwork=initial.canManageNetwork;canManageWorkspace=initial.canManageWorkspace;$('remember-device').checked=credentials.remembered(credential);render(initial);watch();return;
+  }catch(error){if(startup.signal.aborted)return;if(error.status&&error.status<500&&![408,429].includes(error.status)){showStartError(error);return;}const seconds=Math.min(10,2**attempt++);setConnection(false,`호스트 응답을 기다립니다. ${seconds}초 후 다시 연결합니다.`);await reconnectPause(seconds*1000,startup.signal);}}}finally{starting=false;}
+}
 const invite=new URLSearchParams(location.hash.slice(1)).get('invite');
-if(invite){modal(`<div class="join-brand">↔ hand-in-hand.</div><h2>같은 세션에 참여하기</h2><p>동료의 이전 지시와 AI 작업 결과를 그대로 이어갑니다.</p><form id="join-form"><label for="join-name">함께 작업할 이름</label><input id="join-name" placeholder="이름" required maxlength="30" autocomplete="nickname"><div class="modal-actions"><button class="button primary" type="submit">세션 참여하기</button></div><p class="error-text" id="join-error"></p></form>`);$('join-form').onsubmit=async event=>{event.preventDefault();try{const joined=await api('/api/join',{code:invite,name:$('join-name').value});credential=joined.token;sessionStorage.setItem('hih-token',credential);history.replaceState(null,'',location.pathname);$('modal').close();await start();}catch(err){$('join-error').textContent=err.message;}};
+if(invite){modal(`<div class="join-brand">↔ hand-in-hand.</div><h2>같은 세션에 참여하기</h2><p>동료의 이전 지시와 AI 작업 결과를 그대로 이어갑니다.</p><form id="join-form"><label for="join-name">함께 작업할 이름</label><input id="join-name" placeholder="이름" required maxlength="30" autocomplete="nickname"><label class="remember-setting"><input type="checkbox" id="join-remember"> 이 기기에서 연결 기억</label><div class="modal-actions"><button class="button primary" type="submit">세션 참여하기</button></div><p class="error-text" id="join-error"></p></form>`);$('join-form').onsubmit=async event=>{event.preventDefault();try{const joined=await api('/api/join',{code:invite,name:$('join-name').value});credential=joined.token;credentials.set(credential,$('join-remember').checked);history.replaceState(null,'',location.pathname);$('modal').close();await start();}catch(err){$('join-error').textContent=err.message;}};
 }else{
-  (async()=>{if(!credential){const result=await api('/api/bootstrap',{});credential=result.token;sessionStorage.setItem('hih-token',credential);}await start();})().catch(err=>modal(`<h2>세션 연결이 필요해요</h2><p>${e(err.message)}</p><p>호스트 PC에서 먼저 앱을 열거나 초대 링크로 참여하세요.</p><div class="modal-actions"><button class="button" id="retry">연결 다시 확인</button></div>`)).then(()=>{if($('retry'))$('retry').onclick=()=>{sessionStorage.removeItem('hih-token');location.reload();};});
+  start().catch(showStartError);
 }

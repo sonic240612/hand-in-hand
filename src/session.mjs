@@ -139,14 +139,22 @@ export class SessionStore {
     const next=this.enqueue({id:turn.authorId,name:turn.authorName},turn.prompt,`retry-${turn.id}`);
     turn.retriedAs=next.id;turn.retryable=false;this.save();return next;
   }
-  enqueue(member, prompt, requestId) {
-    if (this.state.blocked) throw new Error(this.state.blocked);
-    if (!prompt?.trim() || prompt.length > 20_000) throw new Error('지시는 1~20,000자로 입력해 주세요.');
+  enqueue(member, prompt, requestId, sessionId) {
+    if (sessionId !== undefined && sessionId !== this.state.id) throw Object.assign(new Error('세션이 변경되었습니다. 현재 세션을 확인한 뒤 다시 보내세요.'), { status: 409 });
+    if (typeof prompt !== 'string' || !prompt.trim() || prompt.length > 20_000) throw new Error('지시는 1~20,000자로 입력해 주세요.');
     if (!requestId || typeof requestId !== 'string' || requestId.length > 100) throw new Error('Invalid request ID.');
+    const submittedPrompt = prompt.trim();
     const existing = this.state.turns.find(t => t.authorId === member.id && t.requestId === requestId);
-    if (existing) return existing;
+    if (existing) {
+      // A lost submit response may arrive after the queued instruction was edited.
+      // Compare the first submission, including turns saved before this field existed.
+      const original = existing.submittedPrompt ?? existing.edits?.[0]?.prompt ?? existing.prompt;
+      if (original !== submittedPrompt) throw Object.assign(new Error('같은 요청 ID로 다른 지시를 보낼 수 없습니다. 새 요청으로 보내세요.'), { status: 409 });
+      return existing;
+    }
+    if (this.state.blocked) throw new Error(this.state.blocked);
     const turn = { id: randomUUID(), requestId, authorId: member.id, authorName: member.name,
-      prompt: prompt.trim(), status: 'queued', createdAt: new Date().toISOString(), items: [], tools: [] };
+      prompt: submittedPrompt, submittedPrompt, status: 'queued', createdAt: new Date().toISOString(), items: [], tools: [] };
     this.state.turns.push(turn); this.save(); return turn;
   }
   claim(memberId, runnerId, account, accountFingerprint) {

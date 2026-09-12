@@ -208,7 +208,7 @@ export async function createHost({ port=4317, listen='127.0.0.1', dataDir=path.r
         }
         if(route==='/api/worker/register') {
           if(p.protocolVersion!==3)return json(res,409,{error:'연결 프로그램 업데이트가 필요합니다. git pull과 npm ci 후 실행기를 다시 시작하세요.'});
-          if(store.active?.authorId===member.id)throw new Error('활성 턴을 실행 중인 연결을 교체할 수 없습니다.');
+          if(store.active?.authorId===member.id){const existing=runners.get(member.id);if(existing?.runnerId!==p.runnerId||existing.account!==p.account||existing.accountType!==p.accountType||existing.accountFingerprint!==p.accountFingerprint)throw new Error('활성 턴을 실행 중인 연결을 교체할 수 없습니다.');}
           if(typeof p.runnerId!=='string' || typeof p.account!=='string' || p.account.length>200)throw new Error('Invalid runner identity.');
           runners.set(member.id,{...p,lastSeen:Date.now()});broadcast();return json(res,200,{ok:true});
         }
@@ -220,9 +220,10 @@ export async function createHost({ port=4317, listen='127.0.0.1', dataDir=path.r
           const r=runners.get(member.id);
           if(!r || r.runnerId!==p.runnerId)return json(res,409,{error:'실행기를 다시 연결하세요.'});
           r.lastSeen=Date.now();
-          const turn=workspaceBusy||closing?null:store.claim(member.id,r.runnerId,r.account,r.accountFingerprint);
-          if(turn){
-            try{const delivered=new Set(store.state.turns.filter(t=>t.committedRevision).flatMap(t=>(t.workspaceEvents||[]).map(e=>e.id)));turn.workspaceEvents=(store.state.fileEvents||[]).filter(e=>!delivered.has(e.id)).map(({id,kind,path,actor,at,hash,script,port,instruction,turnId})=>({id,kind,path,actor,at,hash,script,port,instruction,turnId}));const baseline=await history.begin(turn.id);turn.historySkipped=baseline.skipped;store.save();}
+          const active=store.active,replay=active?.authorId===member.id&&active.runnerId===r.runnerId&&active.status==='syncing'&&active.appliedRevision===undefined&&active.claimReady;
+          const turn=workspaceBusy||closing?null:replay?active:store.claim(member.id,r.runnerId,r.account,r.accountFingerprint);
+          if(turn&&!replay){
+            try{const delivered=new Set(store.state.turns.filter(t=>t.committedRevision).flatMap(t=>(t.workspaceEvents||[]).map(e=>e.id)));turn.workspaceEvents=(store.state.fileEvents||[]).filter(e=>!delivered.has(e.id)).map(({id,kind,path,actor,at,hash,script,port,instruction,turnId})=>({id,kind,path,actor,at,hash,script,port,instruction,turnId}));const baseline=await history.begin(turn.id);turn.historySkipped=baseline.skipped;turn.claimReady=true;store.save();}
             catch(error){store.fail(turn,'변경 전 기록을 저장하지 못했습니다: '+error.message,'setup_failed');broadcast();throw error;}
             broadcast();
           }
@@ -249,6 +250,10 @@ export async function createHost({ port=4317, listen='127.0.0.1', dataDir=path.r
         }
         const match=route.match(/^\/api\/worker\/turns\/([^/]+)\/(applied|event|tool|heartbeat|complete|fail)$/);
         if(!match)return json(res,404,{error:'Unknown worker route'});
+        if(match[2]==='fail'){
+          const ended=store.state.turns.find(t=>t.id===match[1]);
+          if(ended&&ended.authorId===member.id&&!['queued','running','syncing'].includes(ended.status)&&ended.leaseHash&&same(ended.leaseHash,digest(String(p.lease||''))))return json(res,200,{ok:true,alreadyFinalized:true});
+        }
         const {turn}=turnFor(req,match[1],p);
         if(match[2]==='heartbeat')return json(res,200,{cancel:!!turn.cancelRequested});
         if(match[2]==='applied') {
@@ -407,7 +412,7 @@ export async function createHost({ port=4317, listen='127.0.0.1', dataDir=path.r
           entry.promise=runAgent({host:`http://127.0.0.1:${actualPort}`,pair,dataDir:path.join(dataDir,'local-agent'),signal:controller.signal,log:()=>{}}).catch(error=>{controller.abort();runners.set(member.id,{lastSeen:0,error:error.message});broadcast();});
           return json(res,200,{ok:true});
         }
-        if(route==='/api/turns' && req.method==='POST') {const p=await body(req),author=memberFor(req);writer(author);if(workspaceBusy||closing)throw new Error('호스트 상태 변경이 끝난 뒤 다시 보내세요.');const turn=store.enqueue(author,p.prompt,p.requestId);broadcast();return json(res,200,{turn});}
+        if(route==='/api/turns' && req.method==='POST') {const p=await body(req),author=memberFor(req);writer(author);if(workspaceBusy||closing)return json(res,503,{error:'호스트 상태 변경이 끝난 뒤 다시 보내세요.'});const turn=store.enqueue(author,p.prompt,p.requestId,p.sessionId);broadcast();return json(res,200,{turn});}
         const retry=route.match(/^\/api\/turns\/([^/]+)\/retry$/);
         if(retry && req.method==='POST') {
           const turn=store.state.turns.find(t=>t.id===retry[1]);
@@ -446,7 +451,7 @@ export async function createHost({ port=4317, listen='127.0.0.1', dataDir=path.r
         return json(res,404,{error:'Unknown route'});
       }
       if(req.method!=='GET')return json(res,405,{error:'Method not allowed'});
-      const staticFiles={'/':'index.html','/app.js':'app.js','/project-ui.js':'project-ui.js','/management-ui.js':'management-ui.js','/style.css':'style.css'};
+      const staticFiles={'/':'index.html','/app.js':'app.js','/client-state.js':'client-state.js','/search-ui.js':'search-ui.js','/search.css':'search.css','/project-ui.js':'project-ui.js','/management-ui.js':'management-ui.js','/style.css':'style.css'};
       const file=staticFiles[route];if(!file)return json(res,404,{error:'Not found'});
       res.writeHead(200,{'Content-Type':file.endsWith('.css')?'text/css':file.endsWith('.js')?'text/javascript':'text/html; charset=utf-8','Cache-Control':'no-cache','X-Content-Type-Options':'nosniff',
         'Content-Security-Policy':"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data: blob:; frame-src 'self' about: blob: http://127.0.0.1:* https://*.ts.net:*; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",'Referrer-Policy':'no-referrer'});

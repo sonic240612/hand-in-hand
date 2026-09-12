@@ -10,6 +10,7 @@ import { HOST_TOOLS } from './workspace.mjs';
 import { connectHostExec } from './exec-transport.mjs';
 import { interactionKind } from './interactions.mjs';
 import { saveReceipt, removeReceipt, flushReceipts } from './completion-receipts.mjs';
+import { abortableDelay, createConnectionRetry, isTransientConnectionError } from './connection-retry.mjs';
 
 export const BASE_INSTRUCTIONS = `You are the coding assistant in hand-in-hand, a shared session. Every turn can come from a different participant and use their own account. Continue this SAME native conversation; all preceding user instructions, assistant responses and tool results still apply. Preserve who said what. Later user corrections override earlier user requirements. Respond in Korean unless asked otherwise. Be concise.
 All project files are on the shared HOST execution environment. Use the selected host environment for shell commands, file edits, tests, builds, and project images. Native Codex tools, web search, installed MCP tools, plugins, skills, and subagents are available according to this participant's account and installed runtime. Personal connectors use this participant's credentials. Respect approval requests and explain unavailable capabilities accurately. Preserve who said what and do not create a new conversation or a handoff summary in place of this session. Native compaction may manage active context while the original session log is retained. This runtime replaces earlier prototype restrictions that allowed only four host_* tools or prohibited native tools. The old host_* tools remain usable for earlier sessions; read before writing with those tools and pass expectedHash.`;
@@ -30,7 +31,10 @@ export async function runNativeTurn(options) {
   let runtimeReady=false;
   try{return await nativeTurn({...options,onRuntimeReady:()=>{runtimeReady=true;}});}
   catch(error){
-    if(!error.hihReported)try{await options.api(`/api/worker/turns/${options.job.id}/fail`,{lease:options.job.lease,error:error.message,failurePhase:runtimeReady?undefined:'setup_failed'});}catch{}
+    if(!error.hihReported){
+      error.hihFailure={lease:options.job.lease,error:error.message,failurePhase:runtimeReady?undefined:'setup_failed'};
+      try{await options.api(`/api/worker/turns/${options.job.id}/fail`,error.hihFailure);error.hihFailureReported=true;}catch{}
+    }
     throw error;
   }finally{clearInterval(heartbeat);}
 }
@@ -142,7 +146,7 @@ async function nativeTurn({ job, accountExpected, api, dataDir, signal, executab
     if(response.thread.historyMode && response.thread.historyMode!=='legacy') throw new Error('이 Codex 버전은 지정한 세션 저장 형식을 지원하지 않습니다.');
     if(!rolloutPath) throw new Error('Codex 세션 저장 경로를 확인할 수 없습니다.');
     await api(`/api/worker/turns/${job.id}/applied`,{lease:job.lease,nativeId,hash:job.baseHash,revision:job.baseRevision,model:response.model});
-    heartbeat=setInterval(()=>api(`/api/worker/turns/${job.id}/heartbeat`,{lease:job.lease}).then(r=>{if(r.cancel) interrupt();}).catch(()=>{fatal ||= new Error('호스트 연결이 끊겼습니다.');interrupt();finish();}),2000);
+    heartbeat=setInterval(()=>api(`/api/worker/turns/${job.id}/heartbeat`,{lease:job.lease}).then(r=>{if(r.cancel) interrupt();}).catch(error=>{fatal ||= Object.assign(new Error('호스트 연결이 끊겼습니다.',{cause:error}),{connectionFailure:isTransientConnectionError(error),status:error.status});interrupt();finish();}),2000);
     if(job.execution) {
       const [mcp,skills]=await Promise.all([
         rpc.request('mcpServerStatus/list',{detail:'toolsAndAuthOnly',limit:100},5000).catch(()=>null),
@@ -185,7 +189,8 @@ async function nativeTurn({ job, accountExpected, api, dataDir, signal, executab
     // Preserve a recoverable partial native log locally; never silently restart with old history.
     if(rolloutPath) {try {await writeFile(path.join(checkpoints,`${job.id}.recovery.jsonl`),await readFile(rolloutPath),{mode:0o600});}catch{}}
     const failurePhase=stage==='setup'?'setup_failed':!nativeId && error.rpcMethod==='thread/resume' && error.code===-32600 ? 'resume_rejected' : undefined;
-    try {await api(`/api/worker/turns/${job.id}/fail`,{lease:job.lease,error:error.message,failurePhase});}catch{}
+    error.hihFailure={lease:job.lease,error:error.message,failurePhase};
+    try {await api(`/api/worker/turns/${job.id}/fail`,error.hihFailure);error.hihFailureReported=true;}catch{}
     throw error;
   } finally {
     clearInterval(heartbeat);clearTimeout(timeout);signal?.removeEventListener('abort',abort);
@@ -193,17 +198,32 @@ async function nativeTurn({ job, accountExpected, api, dataDir, signal, executab
   }
 }
 
-export async function runAgent({ host, pair, dataDir=path.resolve('.hih-agent'), signal, executable, log=console.log, onReady }={}) {
+export async function runAgent({ host, pair, dataDir=path.resolve('.hih-agent'), signal, executable, log=console.log, onReady,
+  rpcFactory=createCodexRuntime,fetchImpl=fetch,retrySleep=abortableDelay }={}) {
   host=new URL(host).origin;
+  if(!/^https?:\/\//.test(host))throw new Error('호스트 주소는 HTTP 또는 HTTPS 주소여야 합니다.');
   await mkdir(dataDir,{recursive:true});
   let token;
   async function api(route,body) {
-    const response=await fetch(host+route,{method:body===undefined?'GET':'POST',headers:{...(token?{Authorization:`Bearer ${token}`} : {}),'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body),signal:AbortSignal.timeout(35_000)});
-    const result=await response.json();
-    if(!response.ok) throw Object.assign(new Error(result.error || `Host HTTP ${response.status}`),{status:response.status});
+    signal?.throwIfAborted();
+    const requestBody=body===undefined?undefined:JSON.stringify(body);
+    const requestSignal=signal?AbortSignal.any([signal,AbortSignal.timeout(35_000)]):AbortSignal.timeout(35_000);
+    let response;
+    try{response=await fetchImpl(host+route,{method:body===undefined?'GET':'POST',headers:{...(token?{Authorization:`Bearer ${token}`} : {}),'Content-Type':'application/json'},body:requestBody,signal:requestSignal});}
+    catch(error){signal?.throwIfAborted();throw Object.assign(error,{connectionFailure:true});}
+    let result;
+    try{result=await response.json();}
+    catch(error){
+      signal?.throwIfAborted();
+      if(response.ok&&(isTransientConnectionError(error)||requestSignal.aborted))throw Object.assign(error,{connectionFailure:true});
+      if(response.ok)throw new Error('호스트 응답을 확인할 수 없습니다. 연결 주소와 호스트 버전을 확인하세요.',{cause:error});
+    }
+    if(!response.ok) throw Object.assign(new Error(result?.error || `Host HTTP ${response.status}`),{status:response.status});
     return result;
   }
+  try{
   if(pair) {
+    // Pairing consumes a one-time code. A lost response is not safe to replay.
     const joined=await api('/api/agent/pair',{code:pair}); token=joined.token;
     await writeFile(path.join(dataDir,'connection.json'),JSON.stringify({host,token}),{mode:0o600});
   } else {
@@ -211,14 +231,21 @@ export async function runAgent({ host, pair, dataDir=path.resolve('.hih-agent'),
     if(saved.host!==host) throw new Error('저장된 연결의 호스트가 다릅니다. 새 연결 코드를 사용하세요.');
     token=saved.token;
   }
-  await flushReceipts(dataDir,api,log);
   const scratch=path.join(dataDir,'empty-workspace');await mkdir(scratch,{recursive:true});
-  const probe=await createCodexRuntime({cwd:scratch,executable,dataDir});
   let account,runtime;
-  try {
-    runtime=await probe.initialize();
-    account=identity((await probe.request('account/read',{refreshToken:false})).account);
-  } finally {await probe.close();}
+  const probeAccount=async()=>{
+    signal?.throwIfAborted();
+    const probe=await rpcFactory({cwd:scratch,executable,dataDir});
+    const abort=()=>{Promise.resolve(probe.close()).catch(()=>{});};
+    signal?.addEventListener('abort',abort,{once:true});
+    try{
+      signal?.throwIfAborted();
+      runtime=await probe.initialize();
+      signal?.throwIfAborted();
+      account=identity((await probe.request('account/read',{refreshToken:false})).account);
+      signal?.throwIfAborted();
+    }finally{signal?.removeEventListener('abort',abort);await probe.close();}
+  };
   const runnerId=randomUUID();
   const register=()=>api('/api/worker/register',{runnerId,protocolVersion:3,features:['completion-receipts'],account:account.label,accountType:account.type,accountFingerprint:account.fingerprint,runtime:runtime.userAgent,device:os.hostname()});
   const recover=async()=>{
@@ -233,25 +260,58 @@ export async function runAgent({ host, pair, dataDir=path.resolve('.hih-agent'),
       log('중단된 세션 원본을 호스트에 복구했습니다. 브라우저의 다시 실행을 누르세요.');
     }
   };
-  await register();await recover();
-  log(`Codex 연결 완료: ${account.label}. 같은 세션의 내 차례를 기다립니다.`);
-  onReady?.({account});
+  const retry=createConnectionRetry({signal,log,sleep:retrySleep});
+  let connected=false,ready=false;
+  const connect=async()=>{
+    // Settle completed writers before replacing the host's runner registration.
+    await flushReceipts(dataDir,api,log);
+    await probeAccount();
+    await register();await recover();
+    connected=true;
+    if(!ready){ready=true;log(`Codex 연결 완료: ${account.label}. 같은 세션의 내 차례를 기다립니다.`);onReady?.({account});}
+  };
   while(!signal?.aborted) {
+    let job;
     try {
-      await flushReceipts(dataDir,api,log);
-      const {job}=await api('/api/worker/claim',{runnerId});
+      ({job}=await retry(async()=>{
+        try{
+          if(!connected)await connect();
+          await flushReceipts(dataDir,api,log);
+          try{return await api('/api/worker/claim',{runnerId});}
+          catch(error){
+            // A restarted host forgets its live runner registry. This specific
+            // claim conflict requests registration, not native turn replay.
+            if(error.status!==409)throw error;
+            connected=false;await connect();return {job:null};
+          }
+        }catch(error){connected=false;throw error;}
+      }));
+    }catch(error){if(signal?.aborted)break;throw error;}
+    try{
       if(job) {
         log(`세션 v${job.baseRevision} → 내 턴 실행`);
-        await runNativeTurn({job,accountExpected:account,api,dataDir,signal,executable,connectExecution:job=>connectHostExec({host,token,job,signal})});
+        await runNativeTurn({job,accountExpected:account,api,dataDir,signal,executable,rpcFactory,connectExecution:job=>connectHostExec({host,token,job,signal})});
         log('동일 세션에 턴 저장 완료');
-      } else await delay(800);
+      } else await abortableDelay(800,signal);
     } catch(error) {
       if(signal?.aborted) break;
       log(`실행기: ${error.message}`);
-      if(error.status===409) {try{await register();await recover();}catch(reconnectError){log(`재연결: ${reconnectError.message}`);}}
-      await delay(2500);
+      // A native failure has already closed its writer and retained its log.
+      // Do not refresh the claim heartbeat while an unacknowledged failure could
+      // leave the previous turn active. A completed receipt takes precedence.
+      await retry(async()=>{
+        await flushReceipts(dataDir,api,log);
+        if(error.hihFailure&&!error.hihFailureReported){
+          await api(`/api/worker/turns/${job.id}/fail`,error.hihFailure);
+          error.hihFailureReported=true;
+        }
+      });
+      connected=false;
+      if(isTransientConnectionError(error)){await retry(connect);continue;}
+      throw error;
     }
   }
+  }catch(error){if(!signal?.aborted)throw error;}
 }
 
 if(process.argv[1] && path.resolve(process.argv[1])===fileURLToPath(import.meta.url)) {

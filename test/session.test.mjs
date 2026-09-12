@@ -39,7 +39,53 @@ test('repeated submits are idempotent; crashed active turn blocks replay after r
   const first=store.enqueue(a,'Write once','request');assert.equal(store.enqueue(a,'Write once','request').id,first.id);assert.equal(store.state.turns.length,1);
   store.claim('a','ra','account','fp');
   const restarted=new SessionStore(path.dirname(store.file));assert.equal(restarted.state.turns[0].status,'interrupted');assert.ok(restarted.state.blocked);
+  assert.equal(restarted.enqueue(a,'Write once','request').id,first.id);assert.equal(restarted.state.turns.length,1);
   assert.equal(restarted.claim('a','ra','account','fp'),null);assert.throws(()=>restarted.enqueue(a,'Repeat','new'));
+});
+test('a submission bound to a previous session cannot enter the current session or resolve its request ID',async t=>{
+  const store=await setup(t),a={id:'a',name:'A'},sessionId=store.state.id;
+  const first=store.enqueue(a,'First project instruction','shared-request',sessionId);
+  assert.equal(first.status,'queued');
+  store.state.id='another-session';store.state.turns=[];store.save();
+  const current=store.enqueue(a,'Current project instruction','shared-request',store.state.id);
+  assert.throws(()=>store.enqueue(a,'First project instruction','new-request',sessionId),error=>error.status===409&&/세션이 변경/.test(error.message));
+  assert.throws(()=>store.enqueue(a,current.prompt,'shared-request',sessionId),error=>error.status===409&&/세션이 변경/.test(error.message));
+  assert.throws(()=>store.enqueue(a,'Invalid binding','null-request',null),error=>error.status===409);
+  assert.deepEqual(store.state.turns.map(turn=>turn.id),[current.id]);
+  assert.equal(new SessionStore(path.dirname(store.file)).state.turns.length,1);
+});
+test('one member cannot reuse a request ID for a different instruction, while different members can',async t=>{
+  const store=await setup(t),a={id:'a',name:'A'},b={id:'b',name:'B'};
+  const first=store.enqueue(a,'  Write once  ','same-id',store.state.id);
+  assert.equal(store.enqueue(a,'Write once','same-id',store.state.id).id,first.id);
+  assert.throws(()=>store.enqueue(a,'Write twice','same-id',store.state.id),error=>error.status===409&&/다른 지시/.test(error.message));
+  const other=store.enqueue(b,'Write twice','same-id',store.state.id);
+  assert.notEqual(other.id,first.id);assert.equal(store.state.turns.length,2);
+  const restarted=new SessionStore(path.dirname(store.file));
+  assert.equal(restarted.enqueue(a,'Write once','same-id',restarted.state.id).id,first.id);
+  assert.throws(()=>restarted.enqueue(a,'Write twice','same-id',restarted.state.id),error=>error.status===409);
+});
+test('retransmitting the original submission after queued edits returns the edited turn without undoing changes',async t=>{
+  const store=await setup(t),a={id:'a',name:'A'};
+  const turn=store.enqueue(a,'Original instruction','request',store.state.id);
+  turn.edits=[{prompt:turn.prompt,actor:a.name,at:new Date().toISOString()}];turn.prompt='Edited instruction';store.save();
+  const restarted=new SessionStore(path.dirname(store.file));
+  assert.equal(restarted.enqueue(a,'Original instruction','request',restarted.state.id).id,turn.id);
+  assert.equal(restarted.state.turns[0].prompt,'Edited instruction');assert.equal(restarted.state.turns.length,1);
+  assert.throws(()=>restarted.enqueue(a,'Edited instruction','request',restarted.state.id),error=>error.status===409);
+  // Older persisted sessions have edit history but no explicit submission field.
+  delete restarted.state.turns[0].submittedPrompt;restarted.save();
+  const legacy=new SessionStore(path.dirname(store.file));
+  assert.equal(legacy.enqueue(a,'Original instruction','request',legacy.state.id).id,turn.id);
+  assert.throws(()=>legacy.enqueue(a,'Edited instruction','request',legacy.state.id),error=>error.status===409);
+  assert.equal(legacy.state.turns[0].prompt,'Edited instruction');assert.equal(legacy.state.turns.length,1);
+});
+test('non-text submissions are rejected as validation errors without calling user-supplied trim',async t=>{
+  const store=await setup(t),a={id:'a',name:'A'};
+  for(const prompt of [null,undefined,{},[],42,true,{trim(){throw new Error('Unexpected trim call');}}]) {
+    assert.throws(()=>store.enqueue(a,prompt,'request',store.state.id),/지시는 1~20,000자로/);
+  }
+  assert.equal(store.state.turns.length,0);
 });
 test('missing current user instruction cannot be committed',async t=>{
   const store=await setup(t),a={id:'a',name:'A'};store.enqueue(a,'Specific required instruction','a1');const turn=store.claim('a','ra','account','fp');

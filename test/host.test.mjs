@@ -8,6 +8,33 @@ import { Workspace } from '../src/workspace.mjs';
 import {digest,LEGACY_COMPACTION_ERROR} from '../src/session.mjs';
 import {nativeId,original,interrupted} from './fixtures/native-session.mjs';
 async function fixture(t){const dir=await mkdtemp(path.join(os.tmpdir(),'hih-host-'));const root=path.join(dir,'workspace');await mkdir(root);await writeFile(path.join(root,'index.html'),'<html><body>Original</body></html>');const host=await createHost({port:0,dataDir:path.join(dir,'state'),workspace:root,allowLocalAgent:false});t.after(async()=>{await host.close();await rm(dir,{recursive:true,force:true});});const call=async(route,p,token)=>{const r=await fetch(host.url+route,{method:p===undefined?'GET':'POST',headers:{'Content-Type':'application/json',...(token?{Authorization:`Bearer ${token}`} : {})},body:p===undefined?undefined:JSON.stringify(p)});return {status:r.status,data:await r.json()};};return {host,call,dir,root};}
+
+test('lost claim and failure acknowledgements are idempotent without replaying an applied native turn',async t=>{
+  const {host,call}=await fixture(t),owner=(await call('/api/bootstrap',{})).data;
+  const code=(await call('/api/pairing',{},owner.token)).data.code,worker=(await call('/api/agent/pair',{code})).data;
+  const registration={runnerId:'retry-runner',protocolVersion:3,account:'fixture account',accountType:'chatgpt',accountFingerprint:'fixture'};
+  await call('/api/worker/register',registration,worker.token);await call('/api/turns',{prompt:'one instruction',requestId:'one',sessionId:host.store.state.id},owner.token);
+  const job=(await call('/api/worker/claim',{runnerId:registration.runnerId},worker.token)).data.job;
+  assert.equal((await call('/api/worker/register',registration,worker.token)).status,200);
+  assert.equal((await call('/api/worker/register',{...registration,runnerId:'other-writer'},worker.token)).status,400);
+  assert.equal((await call('/api/worker/register',{...registration,accountFingerprint:'other-account'},worker.token)).status,400);
+  const retry=(await call('/api/worker/claim',{runnerId:registration.runnerId},worker.token)).data.job;assert.equal(retry.id,job.id);assert.equal(retry.lease,job.lease);
+  await call(`/api/worker/turns/${job.id}/applied`,{lease:job.lease,nativeId:'native',revision:0,hash:digest('')},worker.token);
+  assert.equal((await call('/api/worker/claim',{runnerId:registration.runnerId},worker.token)).data.job,null);
+  const failure={lease:job.lease,error:'transport lost after native writer closed'};
+  assert.equal((await call(`/api/worker/turns/${job.id}/fail`,failure,worker.token)).status,200);
+  assert.equal((await call(`/api/worker/turns/${job.id}/fail`,failure,worker.token)).data.alreadyFinalized,true);
+  assert.equal((await call(`/api/worker/turns/${job.id}/fail`,{...failure,lease:'wrong'},worker.token)).status,400);assert.ok(host.store.state.blocked);assert.equal(host.store.state.turns.length,1);
+});
+
+test('browser submission binds the intended session and confirms an existing request even when later execution is blocked',async t=>{
+  const {host,call}=await fixture(t),owner=(await call('/api/bootstrap',{})).data,id=host.store.state.id;
+  const request={prompt:'exact instruction',requestId:'browser-outbox',sessionId:id};
+  const first=await call('/api/turns',request,owner.token);assert.equal(first.status,200);
+  host.store.state.blocked='unconfirmed execution';host.store.save();assert.equal((await call('/api/turns',request,owner.token)).data.turn.id,first.data.turn.id);
+  assert.equal((await call('/api/turns',{...request,prompt:'another instruction'},owner.token)).status,409);
+  assert.equal((await call('/api/turns',{...request,sessionId:'a-different-session'},owner.token)).status,409);assert.equal(host.store.state.turns.length,1);
+});
 test('invite and pairing are one-use; credentials enforce author, runner, lease and revocation',async t=>{
   const {call}=await fixture(t);
   assert.equal((await call('/api/state')).status,401);
