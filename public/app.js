@@ -8,6 +8,7 @@ const credentials=new BrowserCredentials(sessionStorage,localStorage);
 let credential=credentials.read(),state,me,canLocalConnect=false,canManageNetwork=false,canManageWorkspace=false,streamController;
 let connected=false,journal,submitting=false,submissionError='',submissionPermanent=false,lastJournalError='',starting=false;
 let previewHash='',fileStamp='',selectedFile=null,lastFilesRefresh=0,turnsStamp='';
+const announcedInteractions=new Set();
 function download(blob,name){const url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(url),10_000);}
 const features=projectFeatures({api,modal,toast,escape:e,getState:()=>state,getMe:()=>me,refreshFiles,refreshPreview,download});
 const management=managementFeatures({api,modal,toast,escape:e,getState:()=>state,getMe:()=>me,canManageWorkspace:()=>canManageWorkspace});
@@ -23,6 +24,12 @@ $('modal').addEventListener('click',event=>{if(event.target===$('modal'))$('moda
 function avatar(memberId){const i=Math.max(0,state?.participants.findIndex(p=>p.id===memberId)??0);return `color-${i%3}`;}
 const interactionLabels={approval:'명령·파일 작업 승인',permissions:'호스트 접근 권한 승인',questions:'Codex 질문',elicitation:'연결 도구 확인'};
 function renderInteractions(turn){return (turn.interactions||[]).filter(i=>i.status==='pending').map(i=>`<div class="interaction-card"><strong>${e(interactionLabels[i.kind]||'Codex 확인')}</strong><p>${i.actorId===me.id?'응답하면 작업을 계속합니다.':e(state.participants.find(p=>p.id===i.actorId)?.name||'참여자')+'의 응답을 기다리고 있습니다.'}</p>${i.actorId===me.id?`<button class="button primary" data-interaction="${e(i.id)}">내용 확인 · 응답</button>`:''}</div>`).join('');}
+function announceInteraction(){
+  const pending=state.turns.flatMap(turn=>turn.interactions||[]).find(i=>i.status==='pending'&&i.actorId===me.id&&!announcedInteractions.has(i.id));
+  if(!pending||$('modal').open)return;
+  announcedInteractions.add(pending.id);
+  queueMicrotask(()=>openInteraction(pending.id));
+}
 function elicitationField(key,f,required){
   const attrs=`data-form-key="${e(key)}" ${required?'required':''}`,type=f.type,complex=!['string','number','integer','boolean'].includes(type);
   const input=f.enum?`<select ${attrs} data-value-kind="enum">${f.enum.map(v=>`<option value="${e(JSON.stringify(v))}" ${v===f.default?'selected':''}>${e(v)}</option>`).join('')}</select>`:
@@ -101,6 +108,7 @@ function render(next){
   $('new-session').classList.toggle('hidden',me?.role!=='owner');
   $('network-label').textContent=state.remoteAccess?.mode==='tailscale'?(state.remoteAccess.connected?'Tailscale 연결됨':'Tailscale 설정'):state.remoteAccess?.connected?(new URL(state.remoteAccess.url).protocol==='https:'?'중계 연결됨':'중계 테스트 연결'):state.remoteAccess?.enabled?'중계 재연결 중':'이 PC에서 연결';
   renderTurns();
+  announceInteraction();
   const stamp=state.id+':'+state.revision+':'+state.turns.flatMap(t=>t.tools||[]).filter(t=>t.native&&t.status==='completed').map(t=>t.at).join(',')+':'+state.turns.flatMap(t=>t.tools||[]).filter(t=>t.name==='host_write_file'&&t.result?.success).map(t=>t.result.output.hash).join(',');
   if(stamp!==fileStamp||Date.now()-lastFilesRefresh>10_000){fileStamp=stamp;lastFilesRefresh=Date.now();refreshFiles();refreshPreview();}
   features.render(state,me);

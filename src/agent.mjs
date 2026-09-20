@@ -106,7 +106,7 @@ async function nativeTurn({ job, accountExpected, api, dataDir, signal, executab
       try {rpc.send(msg.method==='item/tool/call'?{id:msg.id,result:{success:false,contentItems:[{type:'inputText',text:error.message}]}}:{id:msg.id,error:{code:-32601,message:error.message}});}catch{}
     }
   });
-  let heartbeat, timeout;
+  let heartbeat;
   try {
     await rpc.initialize();
     signal?.throwIfAborted();
@@ -154,7 +154,6 @@ async function nativeTurn({ job, accountExpected, api, dataDir, signal, executab
       ]);
       emit({kind:'capabilities',catalog:{native:true,mcpTools:mcp?mcp.data.reduce((n,s)=>n+Object.keys(s.tools||{}).length,0):null,skills:skills?skills.data.reduce((n,s)=>n+(s.skills?.length||0),0):null}});
     }
-    timeout=setTimeout(()=>{fatal=new Error('실행 시간 제한(30분)에 도달했습니다.');interrupt();finish();},1_800_000);
     const text=`[hand-in-hand participant: ${job.authorName}; participant_id: ${job.authorId}]\n${job.prompt}`;
     signal?.throwIfAborted();
     const started=await rpc.request('turn/start',{threadId:nativeId,input:[{type:'text',text}],environments,effort:'low'});
@@ -193,7 +192,7 @@ async function nativeTurn({ job, accountExpected, api, dataDir, signal, executab
     try {await api(`/api/worker/turns/${job.id}/fail`,error.hihFailure);error.hihFailureReported=true;}catch{}
     throw error;
   } finally {
-    clearInterval(heartbeat);clearTimeout(timeout);signal?.removeEventListener('abort',abort);
+    clearInterval(heartbeat);signal?.removeEventListener('abort',abort);
     await Promise.allSettled([rpc.close(),execution?.close()]);
   }
 }

@@ -71,7 +71,7 @@ export async function createRelay({port=4318,listen='127.0.0.1',key,publicUrl,po
           const headers=responseHeaders(JSON.parse(Buffer.from(encoded,'base64url').toString()));
           entry.replied=true;clearTimeout(entry.timer);
           const isStream=headers['content-type']?.startsWith('text/event-stream');
-          entry.timer=setTimeout(()=>finish(entry,504,'중계 응답 시간이 만료되었습니다.'),isStream?2_100_000:60_000);
+          entry.timer=isStream?null:setTimeout(()=>finish(entry,504,'중계 응답 시간이 만료되었습니다.'),60_000);
           entry.res.writeHead(status,{...headers,'Cache-Control':'no-store','X-Accel-Buffering':'no'});entry.res.flushHeaders();
           try {await pipeline(req,entry.res);json(res,200,{ok:true});}catch {if(!res.destroyed)json(res,410,{error:'참여자 연결이 끝났습니다.'});}finally{finish(entry);}
           return;
@@ -96,7 +96,9 @@ export async function createRelay({port=4318,listen='127.0.0.1',key,publicUrl,po
       } finally {reservations--;buffered-=bytes;}
     } catch(error){if(!res.headersSent)json(res,error.status||400,{error:error.message});else res.destroy();}
   });
-  server.requestTimeout=660_000;server.headersTimeout=15_000;
+  // Long-running execution streams stay open until the turn, participant, host,
+  // or network closes them. Short non-streaming relay replies still time out.
+  server.requestTimeout=0;server.headersTimeout=15_000;
   await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(port,listen,resolve);});
   origin ||= `http://127.0.0.1:${server.address().port}`;
   const monitor=setInterval(()=>{if(connector&&!online())disconnect('호스트 연결이 끊겼습니다.');},Math.min(1000,offlineMs));monitor.unref();

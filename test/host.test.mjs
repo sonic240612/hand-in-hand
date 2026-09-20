@@ -35,6 +35,31 @@ test('browser submission binds the intended session and confirms an existing req
   assert.equal((await call('/api/turns',{...request,prompt:'another instruction'},owner.token)).status,409);
   assert.equal((await call('/api/turns',{...request,sessionId:'a-different-session'},owner.token)).status,409);assert.equal(host.store.state.turns.length,1);
 });
+
+test('an approval can be answered while its Codex turn is still running',async t=>{
+  const {host,call}=await fixture(t),owner=(await call('/api/bootstrap',{})).data;
+  const code=(await call('/api/pairing',{},owner.token)).data.code;
+  const agent=(await call('/api/agent/pair',{code})).data;
+  const registration={runnerId:'approval-runner',protocolVersion:3,account:'A account',accountType:'chatgpt',accountFingerprint:'account-a'};
+  await call('/api/worker/register',registration,agent.token);
+  await call('/api/turns',{prompt:'Run the reviewed command',requestId:'approval-turn',sessionId:host.store.state.id},owner.token);
+  const job=(await call('/api/worker/claim',{runnerId:registration.runnerId},agent.token)).data.job;
+  await call(`/api/worker/turns/${job.id}/applied`,{lease:job.lease,nativeId:'native-approval',revision:0,hash:job.baseHash},agent.token);
+  const opened=(await call(`/api/worker/turns/${job.id}/interaction/open`,{
+    lease:job.lease,requestId:7,method:'item/commandExecution/requestApproval',
+    params:{command:'npm test',availableDecisions:['accept','decline']}
+  },agent.token)).data;
+  const running=(await call('/api/state',undefined,owner.token)).data.turns.find(turn=>turn.id===job.id);
+  assert.equal(running.status,'running');
+  assert.deepEqual(running.interactions.map(({id,kind,actorId,status})=>({id,kind,actorId,status})),[
+    {id:opened.id,kind:'approval',actorId:owner.member.id,status:'pending'}
+  ]);
+  assert.equal((await call('/api/interactions/'+opened.id,undefined,owner.token)).data.params.command,'npm test');
+  assert.equal((await call('/api/interactions/'+opened.id,{action:'accept'},owner.token)).status,200);
+  assert.deepEqual((await call(`/api/worker/turns/${job.id}/interaction/poll`,{lease:job.lease,id:opened.id},agent.token)).data,{ready:true,result:{decision:'accept'}});
+  assert.equal(host.store.active.status,'running');
+  assert.equal((await call(`/api/worker/turns/${job.id}/fail`,{lease:job.lease,error:'fixture complete'},agent.token)).status,200);
+});
 test('invite and pairing are one-use; credentials enforce author, runner, lease and revocation',async t=>{
   const {call}=await fixture(t);
   assert.equal((await call('/api/state')).status,401);

@@ -12,7 +12,7 @@ export function connectRelay({url,key,localUrl,onStatus=()=>{},retryMs=2000}) {
   const report=(online,error=null)=>{connected=online;onStatus({enabled:true,connected:online,url:origin,error});};
   const request=(route,options={})=>fetch(origin+route,{...options,headers:{...headers,...options.headers},redirect:'error',signal:options.signal||controller.signal});
   async function execute(job) {
-    const cancel=new AbortController(),signal=AbortSignal.any([controller.signal,cancel.signal,AbortSignal.timeout(2_110_000)]);
+    const cancel=new AbortController(),signal=AbortSignal.any([controller.signal,cancel.signal]);
     try {
       if(!validRelayPath(job.path)||!['GET','POST'].includes(job.method))throw new Error('중계 요청 경로가 잘못되었습니다.');
       const allowed={};for(const name of ['authorization','content-type','origin'])if(typeof job.headers?.[name]==='string')allowed[name]=job.headers[name];
